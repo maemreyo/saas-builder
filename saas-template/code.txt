@@ -1,0 +1,2682 @@
+// src/lib/auth/service.ts
+import { createClient } from '@/lib/supabase/server'
+import { createBrowserClient } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+import { redirect } from 'next/navigation'
+import { z } from 'zod'
+
+// Validation schemas
+export const signUpSchema = z.object({
+  email: z.string().email('Invalid email address'),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  name: z.string().optional(),
+})
+
+export const signInSchema = z.object({
+  email: z.string().email('Invalid email address'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+export const resetPasswordSchema = z.object({
+  email: z.string().email('Invalid email address'),
+})
+
+export const updatePasswordSchema = z.object({
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  confirmPassword: z.string(),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ["confirmPassword"],
+})
+
+// Auth service class
+export class AuthService {
+  // Sign up with email/password
+  static async signUp(data: z.infer<typeof signUpSchema>) {
+    const supabase = createClient()
+    
+    const { error, data: authData } = await supabase.auth.signUp({
+      email: data.email,
+      password: data.password,
+      options: {
+        data: {
+          name: data.name,
+        },
+        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
+      },
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    // Create user profile
+    if (authData.user) {
+      await supabase.from('profiles').insert({
+        user_id: authData.user.id,
+        // Additional profile fields can be added here
+      })
+    }
+
+    return { data: authData }
+  }
+
+  // Sign in with email/password
+  static async signIn(data: z.infer<typeof signInSchema>) {
+    const supabase = createClient()
+    
+    const { error, data: authData } = await supabase.auth.signInWithPassword({
+      email: data.email,
+      password: data.password,
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data: authData }
+  }
+
+  // Sign in with OAuth provider
+  static async signInWithProvider(provider: 'google' | 'github') {
+    const supabase = createClient()
+    
+    const { error, data } = await supabase.auth.signInWithOAuth({
+      provider,
+      options: {
+        redirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
+      },
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data }
+  }
+
+  // Sign in with magic link
+  static async signInWithMagicLink(email: string) {
+    const supabase = createClient()
+    
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: {
+        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
+      },
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { success: true }
+  }
+
+  // Send password reset email
+  static async resetPassword(email: string) {
+    const supabase = createClient()
+    
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/reset-password`,
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { success: true }
+  }
+
+  // Update password
+  static async updatePassword(password: string) {
+    const supabase = createClient()
+    
+    const { error } = await supabase.auth.updateUser({
+      password,
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { success: true }
+  }
+
+  // Sign out
+  static async signOut() {
+    const supabase = createClient()
+    const { error } = await supabase.auth.signOut()
+    
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { success: true }
+  }
+
+  // Get current user
+  static async getUser() {
+    const supabase = createClient()
+    const { data: { user }, error } = await supabase.auth.getUser()
+    
+    if (error || !user) {
+      return { user: null }
+    }
+
+    // Get user profile
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('user_id', user.id)
+      .single()
+
+    return { user, profile }
+  }
+
+  // Get session
+  static async getSession() {
+    const supabase = createClient()
+    const { data: { session }, error } = await supabase.auth.getSession()
+    
+    return { session, error }
+  }
+
+  // Refresh session
+  static async refreshSession() {
+    const supabase = createClient()
+    const { data: { session }, error } = await supabase.auth.refreshSession()
+    
+    return { session, error }
+  }
+
+  // Verify email with OTP
+  static async verifyOtp(email: string, token: string, type: 'signup' | 'magiclink' = 'signup') {
+    const supabase = createClient()
+    
+    const { error, data } = await supabase.auth.verifyOtp({
+      email,
+      token,
+      type,
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data }
+  }
+
+  // Enable 2FA
+  static async enable2FA() {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return { error: 'Not authenticated' }
+    }
+
+    const { data, error } = await supabase.auth.mfa.enroll({
+      factorType: 'totp',
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data }
+  }
+
+  // Verify 2FA
+  static async verify2FA(code: string, factorId: string) {
+    const supabase = createClient()
+    
+    const { data, error } = await supabase.auth.mfa.verify({
+      factorId,
+      code,
+    })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data }
+  }
+
+  // Check if user needs 2FA
+  static async check2FARequired() {
+    const supabase = createClient()
+    const { data: { session } } = await supabase.auth.getSession()
+    
+    if (!session) {
+      return { required: false }
+    }
+
+    const { data: factors } = await supabase.auth.mfa.listFactors()
+    
+    return {
+      required: factors && factors.length > 0,
+      factors,
+    }
+  }
+
+  // Session management
+  static async createSession(userId: string, metadata?: any) {
+    const supabase = createClient()
+    
+    const { data, error } = await supabase
+      .from('sessions')
+      .insert({
+        user_id: userId,
+        token: crypto.randomUUID(),
+        expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
+        user_agent: metadata?.userAgent,
+        ip_address: metadata?.ipAddress,
+      })
+      .select()
+      .single()
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data }
+  }
+
+  // List user sessions
+  static async listSessions(userId: string) {
+    const supabase = createClient()
+    
+    const { data, error } = await supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { data }
+  }
+
+  // Revoke session
+  static async revokeSession(sessionId: string) {
+    const supabase = createClient()
+    
+    const { error } = await supabase
+      .from('sessions')
+      .delete()
+      .eq('id', sessionId)
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    return { success: true }
+  }
+
+  // Check user permissions
+  static async checkPermission(permission: string): Promise<boolean> {
+    const { user } = await this.getUser()
+    
+    if (!user) {
+      return false
+    }
+
+    // Add your permission logic here
+    // For now, just check if user exists
+    return true
+  }
+
+  // Protected route helper
+  static async requireAuth(redirectTo: string = '/login') {
+    const { user } = await this.getUser()
+    
+    if (!user) {
+      redirect(redirectTo)
+    }
+
+    return user
+  }
+
+  // Admin route helper
+  static async requireAdmin(redirectTo: string = '/dashboard') {
+    const { user, profile } = await this.getUser()
+    
+    if (!user || !profile) {
+      redirect('/login')
+    }
+
+    const { data: userData } = await createClient()
+      .from('users')
+      .select('role')
+      .eq('id', user.id)
+      .single()
+
+    if (!userData || (userData.role !== 'ADMIN' && userData.role !== 'SUPER_ADMIN')) {
+      redirect(redirectTo)
+    }
+
+    return { user, profile, role: userData.role }
+  }
+}
+
+
+
+
+
+// src/hooks/use-auth.ts
+'use client'
+
+import { useEffect, useState, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
+import { createClient } from '@/lib/supabase/client'
+import { User, Session } from '@supabase/supabase-js'
+
+interface AuthState {
+  user: User | null
+  session: Session | null
+  loading: boolean
+  error: string | null
+}
+
+export function useAuth() {
+  const [state, setState] = useState<AuthState>({
+    user: null,
+    session: null,
+    loading: true,
+    error: null,
+  })
+  const router = useRouter()
+  const supabase = createClient()
+
+  useEffect(() => {
+    // Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setState({
+        user: session?.user ?? null,
+        session,
+        loading: false,
+        error: null,
+      })
+    })
+
+    // Listen for auth changes
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setState({
+        user: session?.user ?? null,
+        session,
+        loading: false,
+        error: null,
+      })
+    })
+
+    return () => subscription.unsubscribe()
+  }, [supabase.auth])
+
+  const signIn = useCallback(
+    async (email: string, password: string) => {
+      setState((prev) => ({ ...prev, loading: true, error: null }))
+      
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      })
+
+      if (error) {
+        setState((prev) => ({ ...prev, loading: false, error: error.message }))
+        return { error: error.message }
+      }
+
+      router.push('/dashboard')
+      return { error: null }
+    },
+    [supabase.auth, router]
+  )
+
+  const signUp = useCallback(
+    async (email: string, password: string, metadata?: any) => {
+      setState((prev) => ({ ...prev, loading: true, error: null }))
+      
+      const { error, data } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: metadata,
+          emailRedirectTo: `${window.location.origin}/auth/callback`,
+        },
+      })
+
+      if (error) {
+        setState((prev) => ({ ...prev, loading: false, error: error.message }))
+        return { error: error.message }
+      }
+
+      return { error: null, data }
+    },
+    [supabase.auth]
+  )
+
+  const signInWithProvider = useCallback(
+    async (provider: 'google' | 'github') => {
+      setState((prev) => ({ ...prev, loading: true, error: null }))
+      
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider,
+        options: {
+          redirectTo: `${window.location.origin}/auth/callback`,
+        },
+      })
+
+      if (error) {
+        setState((prev) => ({ ...prev, loading: false, error: error.message }))
+        return { error: error.message }
+      }
+
+      return { error: null }
+    },
+    [supabase.auth]
+  )
+
+  const signOut = useCallback(async () => {
+    setState((prev) => ({ ...prev, loading: true, error: null }))
+    
+    const { error } = await supabase.auth.signOut()
+
+    if (error) {
+      setState((prev) => ({ ...prev, loading: false, error: error.message }))
+      return { error: error.message }
+    }
+
+    router.push('/login')
+    return { error: null }
+  }, [supabase.auth, router])
+
+  const resetPassword = useCallback(
+    async (email: string) => {
+      setState((prev) => ({ ...prev, loading: true, error: null }))
+      
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/auth/reset-password`,
+      })
+
+      if (error) {
+        setState((prev) => ({ ...prev, loading: false, error: error.message }))
+        return { error: error.message }
+      }
+
+      setState((prev) => ({ ...prev, loading: false }))
+      return { error: null }
+    },
+    [supabase.auth]
+  )
+
+  const updatePassword = useCallback(
+    async (password: string) => {
+      setState((prev) => ({ ...prev, loading: true, error: null }))
+      
+      const { error } = await supabase.auth.updateUser({ password })
+
+      if (error) {
+        setState((prev) => ({ ...prev, loading: false, error: error.message }))
+        return { error: error.message }
+      }
+
+      setState((prev) => ({ ...prev, loading: false }))
+      return { error: null }
+    },
+    [supabase.auth]
+  )
+
+  return {
+    user: state.user,
+    session: state.session,
+    loading: state.loading,
+    error: state.error,
+    signIn,
+    signUp,
+    signInWithProvider,
+    signOut,
+    resetPassword,
+    updatePassword,
+  }
+}
+
+// src/hooks/use-user.ts
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useAuth } from './use-auth'
+
+interface UserProfile {
+  id: string
+  user_id: string
+  bio?: string
+  website?: string
+  location?: string
+  timezone: string
+  language: string
+  created_at: string
+  updated_at: string
+}
+
+interface UserData {
+  id: string
+  email: string
+  name?: string
+  avatar_url?: string
+  role: 'USER' | 'ADMIN' | 'SUPER_ADMIN'
+  created_at: string
+}
+
+export function useUser() {
+  const { user } = useAuth()
+  const [profile, setProfile] = useState<UserProfile | null>(null)
+  const [userData, setUserData] = useState<UserData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const supabase = createClient()
+
+  useEffect(() => {
+    if (!user) {
+      setProfile(null)
+      setUserData(null)
+      setLoading(false)
+      return
+    }
+
+    const fetchUserData = async () => {
+      setLoading(true)
+
+      // Fetch user data
+      const { data: userRecord } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', user.id)
+        .single()
+
+      if (userRecord) {
+        setUserData(userRecord)
+      }
+
+      // Fetch profile
+      const { data: profileData } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('user_id', user.id)
+        .single()
+
+      if (profileData) {
+        setProfile(profileData)
+      }
+
+      setLoading(false)
+    }
+
+    fetchUserData()
+
+    // Subscribe to profile changes
+    const profileSubscription = supabase
+      .channel(`profile:${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'profiles',
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          if (payload.new) {
+            setProfile(payload.new as UserProfile)
+          }
+        }
+      )
+      .subscribe()
+
+    return () => {
+      profileSubscription.unsubscribe()
+    }
+  }, [user, supabase])
+
+  const updateProfile = async (updates: Partial<UserProfile>) => {
+    if (!user) return { error: 'Not authenticated' }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update(updates)
+      .eq('user_id', user.id)
+      .select()
+      .single()
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    setProfile(data)
+    return { data }
+  }
+
+  const updateUser = async (updates: Partial<UserData>) => {
+    if (!user) return { error: 'Not authenticated' }
+
+    const { data, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', user.id)
+      .select()
+      .single()
+
+    if (error) {
+      return { error: error.message }
+    }
+
+    setUserData(data)
+    return { data }
+  }
+
+  return {
+    user: userData,
+    profile,
+    loading,
+    updateProfile,
+    updateUser,
+    isAdmin: userData?.role === 'ADMIN' || userData?.role === 'SUPER_ADMIN',
+    isSuperAdmin: userData?.role === 'SUPER_ADMIN',
+  }
+}
+
+// src/hooks/use-session.ts
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useAuth } from './use-auth'
+
+interface SessionData {
+  id: string
+  user_id: string
+  token: string
+  expires_at: string
+  user_agent?: string
+  ip_address?: string
+  created_at: string
+}
+
+export function useSession() {
+  const { user } = useAuth()
+  const [sessions, setSessions] = useState<SessionData[]>([])
+  const [currentSession, setCurrentSession] = useState<SessionData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const supabase = createClient()
+
+  useEffect(() => {
+    if (!user) {
+      setSessions([])
+      setCurrentSession(null)
+      setLoading(false)
+      return
+    }
+
+    fetchSessions()
+  }, [user])
+
+  const fetchSessions = async () => {
+    if (!user) return
+
+    setLoading(true)
+    const { data, error } = await supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+
+    if (!error && data) {
+      setSessions(data)
+      // Assume the most recent session is current
+      setCurrentSession(data[0] || null)
+    }
+    setLoading(false)
+  }
+
+  const revokeSession = async (sessionId: string) => {
+    const { error } = await supabase
+      .from('sessions')
+      .delete()
+      .eq('id', sessionId)
+
+    if (!error) {
+      setSessions(sessions.filter(s => s.id !== sessionId))
+    }
+
+    return { error }
+  }
+
+  const revokeAllSessions = async (exceptCurrent = true) => {
+    if (!user) return { error: 'Not authenticated' }
+
+    const sessionsToRevoke = exceptCurrent && currentSession
+      ? sessions.filter(s => s.id !== currentSession.id)
+      : sessions
+
+    const { error } = await supabase
+      .from('sessions')
+      .delete()
+      .in('id', sessionsToRevoke.map(s => s.id))
+
+    if (!error) {
+      setSessions(exceptCurrent && currentSession ? [currentSession] : [])
+    }
+
+    return { error }
+  }
+
+  return {
+    sessions,
+    currentSession,
+    loading,
+    revokeSession,
+    revokeAllSessions,
+    refreshSessions: fetchSessions,
+  }
+}
+
+
+
+
+// src/app/(auth)/register/page.tsx
+'use client'
+
+import { useState } from 'react'
+import { useRouter } from 'next/navigation'
+import Link from 'next/link'
+import { useAuth } from '@/hooks/use-auth'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Icons } from '@/components/ui/icons'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+
+export default function RegisterPage() {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [name, setName] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [showVerification, setShowVerification] = useState(false)
+  
+  const { signUp, signInWithProvider } = useAuth()
+  const router = useRouter()
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError(null)
+
+    // Validate passwords match
+    if (password !== confirmPassword) {
+      setError('Passwords do not match')
+      return
+    }
+
+    // Validate password length
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters')
+      return
+    }
+
+    setLoading(true)
+    
+    const { error } = await signUp(email, password, { name })
+
+    if (error) {
+      setError(error)
+      setLoading(false)
+      return
+    }
+
+    // Show verification message
+    setShowVerification(true)
+    setLoading(false)
+  }
+
+  const handleOAuthSignIn = async (provider: 'google' | 'github') => {
+    setError(null)
+    const { error } = await signInWithProvider(provider)
+    if (error) {
+      setError(error)
+    }
+  }
+
+  if (showVerification) {
+    return (
+      <div className="flex min-h-screen items-center justify-center px-4">
+        <div className="w-full max-w-md space-y-8">
+          <div className="text-center">
+            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
+            <h2 className="mt-6 text-3xl font-bold">Check your email</h2>
+            <p className="mt-2 text-sm text-gray-600">
+              We sent a verification link to <strong>{email}</strong>
+            </p>
+          </div>
+          
+          <div className="rounded-lg bg-blue-50 p-4">
+            <p className="text-sm text-blue-800">
+              Click the link in the email to verify your account. If you don't see the email, check your spam folder.
+            </p>
+          </div>
+
+          <div className="text-center text-sm">
+            <span className="text-gray-600">Didn't receive the email? </span>
+            <button
+              onClick={() => setShowVerification(false)}
+              className="font-medium text-primary hover:underline"
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="w-full max-w-md space-y-8">
+        <div className="text-center">
+          <h2 className="text-3xl font-bold">Create your account</h2>
+          <p className="mt-2 text-sm text-gray-600">
+            Already have an account?{' '}
+            <Link href="/login" className="font-medium text-primary hover:underline">
+              Sign in
+            </Link>
+          </p>
+        </div>
+
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+          {error && (
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="name">Name</Label>
+              <Input
+                id="name"
+                name="name"
+                type="text"
+                autoComplete="name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="John Doe"
+                className="mt-1"
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="email">Email address</Label>
+              <Input
+                id="email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="john@example.com"
+                className="mt-1"
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="mt-1"
+              />
+              <p className="mt-1 text-xs text-gray-500">
+                Must be at least 8 characters
+              </p>
+            </div>
+
+            <div>
+              <Label htmlFor="confirmPassword">Confirm password</Label>
+              <Input
+                id="confirmPassword"
+                name="confirmPassword"
+                type="password"
+                autoComplete="new-password"
+                required
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="••••••••"
+                className="mt-1"
+              />
+            </div>
+          </div>
+
+          <Button type="submit" className="w-full" disabled={loading}>
+            {loading ? (
+              <>
+                <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
+                Creating account...
+              </>
+            ) : (
+              'Create account'
+            )}
+          </Button>
+
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase">
+              <span className="bg-background px-2 text-muted-foreground">
+                Or continue with
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleOAuthSignIn('google')}
+              disabled={loading}
+            >
+              <Icons.google className="mr-2 h-4 w-4" />
+              Google
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleOAuthSignIn('github')}
+              disabled={loading}
+            >
+              <Icons.github className="mr-2 h-4 w-4" />
+              GitHub
+            </Button>
+          </div>
+
+          <p className="text-center text-xs text-gray-600">
+            By creating an account, you agree to our{' '}
+            <Link href="/terms" className="underline hover:text-gray-900">
+              Terms of Service
+            </Link>{' '}
+            and{' '}
+            <Link href="/privacy" className="underline hover:text-gray-900">
+              Privacy Policy
+            </Link>
+          </p>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+
+
+
+
+
+// src/components/ui/alert.tsx
+import * as React from "react"
+import { cva, type VariantProps } from "class-variance-authority"
+import { cn } from "@/lib/utils"
+
+const alertVariants = cva(
+  "relative w-full rounded-lg border p-4 [&>svg~*]:pl-7 [&>svg+div]:translate-y-[-3px] [&>svg]:absolute [&>svg]:left-4 [&>svg]:top-4 [&>svg]:text-foreground",
+  {
+    variants: {
+      variant: {
+        default: "bg-background text-foreground",
+        destructive:
+          "border-destructive/50 text-destructive dark:border-destructive [&>svg]:text-destructive",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+)
+
+const Alert = React.forwardRef<
+  HTMLDivElement,
+  React.HTMLAttributes<HTMLDivElement> & VariantProps<typeof alertVariants>
+>(({ className, variant, ...props }, ref) => (
+  <div
+    ref={ref}
+    role="alert"
+    className={cn(alertVariants({ variant }), className)}
+    {...props}
+  />
+))
+Alert.displayName = "Alert"
+
+const AlertTitle = React.forwardRef<
+  HTMLParagraphElement,
+  React.HTMLAttributes<HTMLHeadingElement>
+>(({ className, ...props }, ref) => (
+  <h5
+    ref={ref}
+    className={cn("mb-1 font-medium leading-none tracking-tight", className)}
+    {...props}
+  />
+))
+AlertTitle.displayName = "AlertTitle"
+
+const AlertDescription = React.forwardRef<
+  HTMLParagraphElement,
+  React.HTMLAttributes<HTMLParagraphElement>
+>(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("text-sm [&_p]:leading-relaxed", className)}
+    {...props}
+  />
+))
+AlertDescription.displayName = "AlertDescription"
+
+export { Alert, AlertTitle, AlertDescription }
+
+
+
+
+// src/components/ui/select.tsx
+'use client'
+
+import * as React from "react"
+import * as SelectPrimitive from "@radix-ui/react-select"
+import { Check, ChevronDown, ChevronUp } from "lucide-react"
+import { cn } from "@/lib/utils"
+
+const Select = SelectPrimitive.Root
+
+const SelectGroup = SelectPrimitive.Group
+
+const SelectValue = SelectPrimitive.Value
+
+const SelectTrigger = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.Trigger>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger>
+>(({ className, children, ...props }, ref) => (
+  <SelectPrimitive.Trigger
+    ref={ref}
+    className={cn(
+      "flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 [&>span]:line-clamp-1",
+      className
+    )}
+    {...props}
+  >
+    {children}
+    <SelectPrimitive.Icon asChild>
+      <ChevronDown className="h-4 w-4 opacity-50" />
+    </SelectPrimitive.Icon>
+  </SelectPrimitive.Trigger>
+))
+SelectTrigger.displayName = SelectPrimitive.Trigger.displayName
+
+const SelectScrollUpButton = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.ScrollUpButton>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.ScrollUpButton>
+>(({ className, ...props }, ref) => (
+  <SelectPrimitive.ScrollUpButton
+    ref={ref}
+    className={cn(
+      "flex cursor-default items-center justify-center py-1",
+      className
+    )}
+    {...props}
+  >
+    <ChevronUp className="h-4 w-4" />
+  </SelectPrimitive.ScrollUpButton>
+))
+SelectScrollUpButton.displayName = SelectPrimitive.ScrollUpButton.displayName
+
+const SelectScrollDownButton = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.ScrollDownButton>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.ScrollDownButton>
+>(({ className, ...props }, ref) => (
+  <SelectPrimitive.ScrollDownButton
+    ref={ref}
+    className={cn(
+      "flex cursor-default items-center justify-center py-1",
+      className
+    )}
+    {...props}
+  >
+    <ChevronDown className="h-4 w-4" />
+  </SelectPrimitive.ScrollDownButton>
+))
+SelectScrollDownButton.displayName =
+  SelectPrimitive.ScrollDownButton.displayName
+
+const SelectContent = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Content>
+>(({ className, children, position = "popper", ...props }, ref) => (
+  <SelectPrimitive.Portal>
+    <SelectPrimitive.Content
+      ref={ref}
+      className={cn(
+        "relative z-50 max-h-96 min-w-[8rem] overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        position === "popper" &&
+          "data-[side=bottom]:translate-y-1 data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1 data-[side=top]:-translate-y-1",
+        className
+      )}
+      position={position}
+      {...props}
+    >
+      <SelectScrollUpButton />
+      <SelectPrimitive.Viewport
+        className={cn(
+          "p-1",
+          position === "popper" &&
+            "h-[var(--radix-select-trigger-height)] w-full min-w-[var(--radix-select-trigger-width)]"
+        )}
+      >
+        {children}
+      </SelectPrimitive.Viewport>
+      <SelectScrollDownButton />
+    </SelectPrimitive.Content>
+  </SelectPrimitive.Portal>
+))
+SelectContent.displayName = SelectPrimitive.Content.displayName
+
+const SelectLabel = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Label>
+>(({ className, ...props }, ref) => (
+  <SelectPrimitive.Label
+    ref={ref}
+    className={cn("py-1.5 pl-8 pr-2 text-sm font-semibold", className)}
+    {...props}
+  />
+))
+SelectLabel.displayName = SelectPrimitive.Label.displayName
+
+const SelectItem = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.Item>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
+>(({ className, children, ...props }, ref) => (
+  <SelectPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    {...props}
+  >
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <SelectPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </SelectPrimitive.ItemIndicator>
+    </span>
+
+    <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+  </SelectPrimitive.Item>
+))
+SelectItem.displayName = SelectPrimitive.Item.displayName
+
+const SelectSeparator = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.Separator>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Separator>
+>(({ className, ...props }, ref) => (
+  <SelectPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    {...props}
+  />
+))
+SelectSeparator.displayName = SelectPrimitive.Separator.displayName
+
+export {
+  Select,
+  SelectGroup,
+  SelectValue,
+  SelectTrigger,
+  SelectContent,
+  SelectLabel,
+  SelectItem,
+  SelectSeparator,
+  SelectScrollUpButton,
+  SelectScrollDownButton,
+}
+
+
+
+
+// src/components/ui/table.tsx
+import * as React from "react"
+import { cn } from "@/lib/utils"
+
+const Table = React.forwardRef<
+  HTMLTableElement,
+  React.HTMLAttributes<HTMLTableElement>
+>(({ className, ...props }, ref) => (
+  <div className="relative w-full overflow-auto">
+    <table
+      ref={ref}
+      className={cn("w-full caption-bottom text-sm", className)}
+      {...props}
+    />
+  </div>
+))
+Table.displayName = "Table"
+
+const TableHeader = React.forwardRef<
+  HTMLTableSectionElement,
+  React.HTMLAttributes<HTMLTableSectionElement>
+>(({ className, ...props }, ref) => (
+  <thead ref={ref} className={cn("[&_tr]:border-b", className)} {...props} />
+))
+TableHeader.displayName = "TableHeader"
+
+const TableBody = React.forwardRef<
+  HTMLTableSectionElement,
+  React.HTMLAttributes<HTMLTableSectionElement>
+>(({ className, ...props }, ref) => (
+  <tbody
+    ref={ref}
+    className={cn("[&_tr:last-child]:border-0", className)}
+    {...props}
+  />
+))
+TableBody.displayName = "TableBody"
+
+const TableFooter = React.forwardRef<
+  HTMLTableSectionElement,
+  React.HTMLAttributes<HTMLTableSectionElement>
+>(({ className, ...props }, ref) => (
+  <tfoot
+    ref={ref}
+    className={cn(
+      "border-t bg-muted/50 font-medium [&>tr]:last:border-b-0",
+      className
+    )}
+    {...props}
+  />
+))
+TableFooter.displayName = "TableFooter"
+
+const TableRow = React.forwardRef<
+  HTMLTableRowElement,
+  React.HTMLAttributes<HTMLTableRowElement>
+>(({ className, ...props }, ref) => (
+  <tr
+    ref={ref}
+    className={cn(
+      "border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted",
+      className
+    )}
+    {...props}
+  />
+))
+TableRow.displayName = "TableRow"
+
+const TableHead = React.forwardRef<
+  HTMLTableCellElement,
+  React.ThHTMLAttributes<HTMLTableCellElement>
+>(({ className, ...props }, ref) => (
+  <th
+    ref={ref}
+    className={cn(
+      "h-12 px-4 text-left align-middle font-medium text-muted-foreground [&:has([role=checkbox])]:pr-0",
+      className
+    )}
+    {...props}
+  />
+))
+TableHead.displayName = "TableHead"
+
+const TableCell = React.forwardRef<
+  HTMLTableCellElement,
+  React.TdHTMLAttributes<HTMLTableCellElement>
+>(({ className, ...props }, ref) => (
+  <td
+    ref={ref}
+    className={cn("p-4 align-middle [&:has([role=checkbox])]:pr-0", className)}
+    {...props}
+  />
+))
+TableCell.displayName = "TableCell"
+
+const TableCaption = React.forwardRef<
+  HTMLTableCaptionElement,
+  React.HTMLAttributes<HTMLTableCaptionElement>
+>(({ className, ...props }, ref) => (
+  <caption
+    ref={ref}
+    className={cn("mt-4 text-sm text-muted-foreground", className)}
+    {...props}
+  />
+))
+TableCaption.displayName = "TableCaption"
+
+export {
+  Table,
+  TableHeader,
+  TableBody,
+  TableFooter,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableCaption,
+}
+
+// src/components/ui/progress.tsx
+'use client'
+
+import * as React from "react"
+import * as ProgressPrimitive from "@radix-ui/react-progress"
+import { cn } from "@/lib/utils"
+
+const Progress = React.forwardRef<
+  React.ElementRef<typeof ProgressPrimitive.Root>,
+  React.ComponentPropsWithoutRef<typeof ProgressPrimitive.Root>
+>(({ className, value, ...props }, ref) => (
+  <ProgressPrimitive.Root
+    ref={ref}
+    className={cn(
+      "relative h-4 w-full overflow-hidden rounded-full bg-secondary",
+      className
+    )}
+    {...props}
+  >
+    <ProgressPrimitive.Indicator
+      className="h-full w-full flex-1 bg-primary transition-all"
+      style={{ transform: `translateX(-${100 - (value || 0)}%)` }}
+    />
+  </ProgressPrimitive.Root>
+))
+Progress.displayName = ProgressPrimitive.Root.displayName
+
+export { Progress }
+
+
+
+
+// src/app/(auth)/reset-password/page.tsx
+'use client'
+
+import { useState, useEffect } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import Link from 'next/link'
+import { useAuth } from '@/hooks/use-auth'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Icons } from '@/components/ui/icons'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+
+export default function ResetPasswordPage() {
+  const searchParams = useSearchParams()
+  const isPasswordReset = searchParams.get('type') === 'recovery'
+  
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState(false)
+  const [loading, setLoading] = useState(false)
+  
+  const { resetPassword, updatePassword } = useAuth()
+  const router = useRouter()
+
+  // If user came from email link, show password update form
+  if (isPasswordReset) {
+    const handlePasswordUpdate = async (e: React.FormEvent) => {
+      e.preventDefault()
+      setError(null)
+
+      if (password !== confirmPassword) {
+        setError('Passwords do not match')
+        return
+      }
+
+      if (password.length < 8) {
+        setError('Password must be at least 8 characters')
+        return
+      }
+
+      setLoading(true)
+      const { error } = await updatePassword(password)
+
+      if (error) {
+        setError(error)
+        setLoading(false)
+        return
+      }
+
+      setSuccess(true)
+      setLoading(false)
+      
+      // Redirect to dashboard after 2 seconds
+      setTimeout(() => {
+        router.push('/dashboard')
+      }, 2000)
+    }
+
+    if (success) {
+      return (
+        <div className="flex min-h-screen items-center justify-center px-4">
+          <div className="w-full max-w-md space-y-8 text-center">
+            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
+            <h2 className="text-2xl font-bold">Password updated successfully!</h2>
+            <p className="text-sm text-gray-600">
+              Redirecting you to the dashboard...
+            </p>
+          </div>
+        </div>
+      )
+    }
+
+    return (
+      <div className="flex min-h-screen items-center justify-center px-4">
+        <div className="w-full max-w-md space-y-8">
+          <div className="text-center">
+            <h2 className="text-3xl font-bold">Set new password</h2>
+            <p className="mt-2 text-sm text-gray-600">
+              Please enter your new password below
+            </p>
+          </div>
+
+          <form className="mt-8 space-y-6" onSubmit={handlePasswordUpdate}>
+            {error && (
+              <Alert variant="destructive">
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
+
+            <div className="space-y-4">
+              <div>
+                <Label htmlFor="password">New password</Label>
+                <Input
+                  id="password"
+                  name="password"
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="mt-1"
+                />
+                <p className="mt-1 text-xs text-gray-500">
+                  Must be at least 8 characters
+                </p>
+              </div>
+
+              <div>
+                <Label htmlFor="confirmPassword">Confirm new password</Label>
+                <Input
+                  id="confirmPassword"
+                  name="confirmPassword"
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="mt-1"
+                />
+              </div>
+            </div>
+
+            <Button type="submit" className="w-full" disabled={loading}>
+              {loading ? (
+                <>
+                  <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
+                  Updating password...
+                </>
+              ) : (
+                'Update password'
+              )}
+            </Button>
+          </form>
+        </div>
+      </div>
+    )
+  }
+
+  // Otherwise show password reset request form
+  const handleResetRequest = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError(null)
+    setLoading(true)
+
+    const { error } = await resetPassword(email)
+
+    if (error) {
+      setError(error)
+      setLoading(false)
+      return
+    }
+
+    setSuccess(true)
+    setLoading(false)
+  }
+
+  if (success) {
+    return (
+      <div className="flex min-h-screen items-center justify-center px-4">
+        <div className="w-full max-w-md space-y-8">
+          <div className="text-center">
+            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
+            <h2 className="mt-6 text-3xl font-bold">Check your email</h2>
+            <p className="mt-2 text-sm text-gray-600">
+              We sent a password reset link to <strong>{email}</strong>
+            </p>
+          </div>
+          
+          <div className="rounded-lg bg-blue-50 p-4">
+            <p className="text-sm text-blue-800">
+              Click the link in the email to reset your password. If you don't see the email, check your spam folder.
+            </p>
+          </div>
+
+          <div className="text-center">
+            <Link
+              href="/login"
+              className="text-sm font-medium text-primary hover:underline"
+            >
+              Back to sign in
+            </Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="w-full max-w-md space-y-8">
+        <div className="text-center">
+          <h2 className="text-3xl font-bold">Forgot your password?</h2>
+          <p className="mt-2 text-sm text-gray-600">
+            No worries, we'll send you reset instructions
+          </p>
+        </div>
+
+        <form className="mt-8 space-y-6" onSubmit={handleResetRequest}>
+          {error && (
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+
+          <div>
+            <Label htmlFor="email">Email address</Label>
+            <Input
+              id="email"
+              name="email"
+              type="email"
+              autoComplete="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="john@example.com"
+              className="mt-1"
+            />
+          </div>
+
+          <Button type="submit" className="w-full" disabled={loading}>
+            {loading ? (
+              <>
+                <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
+                Sending reset link...
+              </>
+            ) : (
+              'Send reset link'
+            )}
+          </Button>
+
+          <div className="text-center">
+            <Link
+              href="/login"
+              className="text-sm font-medium text-primary hover:underline"
+            >
+              Back to sign in
+            </Link>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// src/app/auth/callback/route.ts
+import { createClient } from '@/lib/supabase/server'
+import { NextResponse } from 'next/server'
+
+export async function GET(request: Request) {
+  const { searchParams, origin } = new URL(request.url)
+  const code = searchParams.get('code')
+  const next = searchParams.get('next') ?? '/dashboard'
+
+  if (code) {
+    const supabase = createClient()
+    const { error } = await supabase.auth.exchangeCodeForSession(code)
+    
+    if (!error) {
+      return NextResponse.redirect(`${origin}${next}`)
+    }
+  }
+
+  // Return the user to an error page with instructions
+  return NextResponse.redirect(`${origin}/auth/error`)
+}
+
+// src/app/(auth)/auth/error/page.tsx
+export default function AuthErrorPage() {
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="w-full max-w-md space-y-8 text-center">
+        <div>
+          <h2 className="text-3xl font-bold text-red-600">Authentication Error</h2>
+          <p className="mt-2 text-sm text-gray-600">
+            There was a problem signing you in. Please try again.
+          </p>
+        </div>
+        
+        <div className="space-y-4">
+          <a
+            href="/login"
+            className="block w-full rounded-md bg-primary px-4 py-2 text-center text-sm font-medium text-white hover:bg-primary/90"
+          >
+            Back to Login
+          </a>
+          
+          <p className="text-xs text-gray-500">
+            If this problem persists, please contact support.
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+
+// src/app/(auth)/login/page.tsx
+'use client'
+
+import { useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import Link from 'next/link'
+import { useAuth } from '@/hooks/use-auth'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Icons } from '@/components/ui/icons'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+
+export default function LoginPage() {
+  const searchParams = useSearchParams()
+  const redirectTo = searchParams.get('redirectTo') || '/dashboard'
+  
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [magicLinkEmail, setMagicLinkEmail] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [magicLinkSent, setMagicLinkSent] = useState(false)
+  
+  const router = useRouter()
+  const { signIn, signInWithProvider } = useAuth()
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setLoading(true)
+    setError(null)
+
+    const { error } = await signIn(email, password)
+
+    if (error) {
+      setError(error)
+      setLoading(false)
+      return
+    }
+
+    router.push(redirectTo)
+  }
+
+  const handleMagicLink = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setLoading(true)
+    setError(null)
+
+    try {
+      const response = await fetch('/api/auth/magic-link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: magicLinkEmail }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to send magic link')
+      }
+
+      setMagicLinkSent(true)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleOAuthSignIn = async (provider: 'google' | 'github') => {
+    setError(null)
+    const { error } = await signInWithProvider(provider)
+    if (error) {
+      setError(error)
+    }
+  }
+
+  if (magicLinkSent) {
+    return (
+      <div className="flex min-h-screen items-center justify-center px-4">
+        <div className="w-full max-w-md space-y-8">
+          <div className="text-center">
+            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
+            <h2 className="mt-6 text-3xl font-bold">Check your email</h2>
+            <p className="mt-2 text-sm text-gray-600">
+              We sent a sign in link to <strong>{magicLinkEmail}</strong>
+            </p>
+          </div>
+          
+          <div className="rounded-lg bg-blue-50 p-4">
+            <p className="text-sm text-blue-800">
+              Click the link in the email to sign in. If you don't see the email, check your spam folder.
+            </p>
+          </div>
+
+          <button
+            onClick={() => setMagicLinkSent(false)}
+            className="block w-full text-center text-sm font-medium text-primary hover:underline"
+          >
+            Use a different email
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="w-full max-w-md space-y-8">
+        <div className="text-center">
+          <h2 className="text-3xl font-bold">Sign in to your account</h2>
+          <p className="mt-2 text-sm text-gray-600">
+            Or{' '}
+            <Link href="/register" className="font-medium text-primary hover:underline">
+              create a new account
+            </Link>
+          </p>
+        </div>
+
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        <Tabs defaultValue="password" className="w-full">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="password">Password</TabsTrigger>
+            <TabsTrigger value="magic-link">Magic Link</TabsTrigger>
+          </TabsList>
+          
+          <TabsContent value="password" className="mt-6">
+            <form onSubmit={handleLogin} className="space-y-6">
+              <div className="space-y-4">
+                <div>
+                  <Label htmlFor="email">Email address</Label>
+                  <Input
+                    id="email"
+                    name="email"
+                    type="email"
+                    autoComplete="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="john@example.com"
+                    className="mt-1"
+                  />
+                </div>
+                
+                <div>
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="password">Password</Label>
+                    <Link
+                      href="/reset-password"
+                      className="text-sm text-primary hover:underline"
+                    >
+                      Forgot password?
+                    </Link>
+                  </div>
+                  <Input
+                    id="password"
+                    name="password"
+                    type="password"
+                    autoComplete="current-password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="mt-1"
+                  />
+                </div>
+              </div>
+
+              <Button type="submit" className="w-full" disabled={loading}>
+                {loading ? (
+                  <>
+                    <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
+                    Signing in...
+                  </>
+                ) : (
+                  'Sign in'
+                )}
+              </Button>
+            </form>
+          </TabsContent>
+          
+          <TabsContent value="magic-link" className="mt-6">
+            <form onSubmit={handleMagicLink} className="space-y-6">
+              <div>
+                <Label htmlFor="magic-email">Email address</Label>
+                <Input
+                  id="magic-email"
+                  name="email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={magicLinkEmail}
+                  onChange={(e) => setMagicLinkEmail(e.target.value)}
+                  placeholder="john@example.com"
+                  className="mt-1"
+                />
+                <p className="mt-2 text-xs text-gray-500">
+                  We'll send you a magic link to sign in without a password
+                </p>
+              </div>
+
+              <Button type="submit" className="w-full" disabled={loading}>
+                {loading ? (
+                  <>
+                    <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
+                    Sending magic link...
+                  </>
+                ) : (
+                  'Send magic link'
+                )}
+              </Button>
+            </form>
+          </TabsContent>
+        </Tabs>
+
+        <div className="relative">
+          <div className="absolute inset-0 flex items-center">
+            <span className="w-full border-t" />
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-background px-2 text-muted-foreground">
+              Or continue with
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOAuthSignIn('google')}
+            disabled={loading}
+          >
+            <Icons.google className="mr-2 h-4 w-4" />
+            Google
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => handleOAuthSignIn('github')}
+            disabled={loading}
+          >
+            <Icons.github className="mr-2 h-4 w-4" />
+            GitHub
+          </Button>
+        </div>
+
+        <p className="text-center text-xs text-gray-600">
+          By signing in, you agree to our{' '}
+          <Link href="/terms" className="underline hover:text-gray-900">
+            Terms of Service
+          </Link>{' '}
+          and{' '}
+          <Link href="/privacy" className="underline hover:text-gray-900">
+            Privacy Policy
+          </Link>
+        </p>
+      </div>
+    </div>
+  )
+}
+
+
+
+
+
+// src/components/ui/tabs.tsx
+'use client'
+
+import * as React from "react"
+import * as TabsPrimitive from "@radix-ui/react-tabs"
+import { cn } from "@/lib/utils"
+
+const Tabs = TabsPrimitive.Root
+
+const TabsList = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.List>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.List>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.List
+    ref={ref}
+    className={cn(
+      "inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground",
+      className
+    )}
+    {...props}
+  />
+))
+TabsList.displayName = TabsPrimitive.List.displayName
+
+const TabsTrigger = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.Trigger>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Trigger>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.Trigger
+    ref={ref}
+    className={cn(
+      "inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm",
+      className
+    )}
+    {...props}
+  />
+))
+TabsTrigger.displayName = TabsPrimitive.Trigger.displayName
+
+const TabsContent = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Content>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.Content
+    ref={ref}
+    className={cn(
+      "mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+      className
+    )}
+    {...props}
+  />
+))
+TabsContent.displayName = TabsPrimitive.Content.displayName
+
+export { Tabs, TabsList, TabsTrigger, TabsContent }
+
+
+
+
+// src/app/api/auth/magic-link/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { z } from 'zod'
+
+const magicLinkSchema = z.object({
+  email: z.string().email('Invalid email address'),
+})
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json()
+    const { email } = magicLinkSchema.parse(body)
+    
+    const supabase = createClient()
+    
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: {
+        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
+      },
+    })
+
+    if (error) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: 400 }
+      )
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: error.errors[0].message },
+        { status: 400 }
+      )
+    }
+    
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/app/api/auth/2fa/enable/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+
+export async function POST() {
+  const supabase = createClient()
+  
+  const { data: { user } } = await supabase.auth.getUser()
+  
+  if (!user) {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 401 }
+    )
+  }
+
+  const { data, error } = await supabase.auth.mfa.enroll({
+    factorType: 'totp',
+  })
+
+  if (error) {
+    return NextResponse.json(
+      { error: error.message },
+      { status: 400 }
+    )
+  }
+
+  return NextResponse.json({
+    qrCode: data.totp.qr_code,
+    secret: data.totp.secret,
+    factorId: data.id,
+  })
+}
+
+// src/app/api/auth/2fa/verify/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { z } from 'zod'
+
+const verify2FASchema = z.object({
+  code: z.string().length(6),
+  factorId: z.string(),
+})
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json()
+    const { code, factorId } = verify2FASchema.parse(body)
+    
+    const supabase = createClient()
+    
+    const { data, error } = await supabase.auth.mfa.verify({
+      factorId,
+      code,
+    })
+
+    if (error) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: 400 }
+      )
+    }
+
+    return NextResponse.json({ success: true, data })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: error.errors[0].message },
+        { status: 400 }
+      )
+    }
+    
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/app/api/auth/2fa/disable/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { z } from 'zod'
+
+const disable2FASchema = z.object({
+  factorId: z.string(),
+})
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json()
+    const { factorId } = disable2FASchema.parse(body)
+    
+    const supabase = createClient()
+    
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 }
+      )
+    }
+
+    const { error } = await supabase.auth.mfa.unenroll({
+      factorId,
+    })
+
+    if (error) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: 400 }
+      )
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: error.errors[0].message },
+        { status: 400 }
+      )
+    }
+    
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/app/api/auth/sessions/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+
+export async function GET() {
+  const supabase = createClient()
+  
+  const { data: { user } } = await supabase.auth.getUser()
+  
+  if (!user) {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 401 }
+    )
+  }
+
+  const { data, error } = await supabase
+    .from('sessions')
+    .select('*')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    return NextResponse.json(
+      { error: error.message },
+      { status: 400 }
+    )
+  }
+
+  return NextResponse.json(data)
+}
+
+export async function DELETE(request: Request) {
+  const { searchParams } = new URL(request.url)
+  const sessionId = searchParams.get('id')
+  
+  if (!sessionId) {
+    return NextResponse.json(
+      { error: 'Session ID required' },
+      { status: 400 }
+    )
+  }
+  
+  const supabase = createClient()
+  
+  const { data: { user } } = await supabase.auth.getUser()
+  
+  if (!user) {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 401 }
+    )
+  }
+
+  const { error } = await supabase
+    .from('sessions')
+    .delete()
+    .eq('id', sessionId)
+    .eq('user_id', user.id) // Ensure user can only delete their own sessions
+
+  if (error) {
+    return NextResponse.json(
+      { error: error.message },
+      { status: 400 }
+    )
+  }
+
+  return NextResponse.json({ success: true })
+}
+
+
+
+
+// src/components/auth/two-factor-setup.tsx
+'use client'
+
+import { useState } from 'react'
+import { QRCodeSVG } from 'qrcode.react'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Icons } from '@/components/ui/icons'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription as DialogDesc } from '@/components/ui/dialog'
+
+interface TwoFactorSetupProps {
+  isEnabled?: boolean
+  onUpdate?: () => void
+}
+
+export function TwoFactorSetup({ isEnabled = false, onUpdate }: TwoFactorSetupProps) {
+  const [showSetup, setShowSetup] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [qrCode, setQrCode] = useState<string | null>(null)
+  const [secret, setSecret] = useState<string | null>(null)
+  const [factorId, setFactorId] = useState<string | null>(null)
+  const [verificationCode, setVerificationCode] = useState('')
+  const [setupComplete, setSetupComplete] = useState(false)
+
+  const enable2FA = async () => {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const response = await fetch('/api/auth/2fa/enable', {
+        method: 'POST',
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to enable 2FA')
+      }
+
+      setQrCode(data.qrCode)
+      setSecret(data.secret)
+      setFactorId(data.factorId)
+      setShowSetup(true)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const verify2FA = async () => {
+    if (!factorId || !verificationCode) return
+
+    setLoading(true)
+    setError(null)
+
+    try {
+      const response = await fetch('/api/auth/2fa/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: verificationCode,
+          factorId,
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Invalid verification code')
+      }
+
+      setSetupComplete(true)
+      setTimeout(() => {
+        setShowSetup(false)
+        setSetupComplete(false)
+        setQrCode(null)
+        setSecret(null)
+        setVerificationCode('')
+        if (onUpdate) onUpdate()
+      }, 2000)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const disable2FA = async () => {
+    if (!confirm('Are you sure you want to disable two-factor authentication?')) {
+      return
+    }
+
+    setLoading(true)
+    setError(null)
+
+    try {
+      // In a real app, you'd need to get the factor ID from somewhere
+      // For now, we'll assume it's stored or can be retrieved
+      const response = await fetch('/api/auth/2fa/disable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          factorId: 'current-factor-id', // This should be the actual factor ID
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to disable 2FA')
+      }
+
+      if (onUpdate) onUpdate()
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>Two-Factor Authentication</CardTitle>
+          <CardDescription>
+            Add an extra layer of security to your account
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <div className={`h-3 w-3 rounded-full ${isEnabled ? 'bg-green-500' : 'bg-gray-300'}`} />
+              <span className="text-sm font-medium">
+                {isEnabled ? 'Enabled' : 'Disabled'}
+              </span>
+            </div>
+            <Button
+              onClick={isEnabled ? disable2FA : enable2FA}
+              variant={isEnabled ? 'destructive' : 'default'}
+              size="sm"
+              disabled={loading}
+            >
+              {loading && <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />}
+              {isEnabled ? 'Disable' : 'Enable'}
+            </Button>
+          </div>
+
+          {error && (
+            <Alert variant="destructive" className="mt-4">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+        </CardContent>
+      </Card>
+
+      <Dialog open={showSetup} onOpenChange={setShowSetup}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Set up Two-Factor Authentication</DialogTitle>
+            <DialogDesc>
+              Scan the QR code with your authenticator app
+            </DialogDesc>
+          </DialogHeader>
+
+          {setupComplete ? (
+            <div className="flex flex-col items-center space-y-4 py-8">
+              <Icons.check className="h-16 w-16 text-green-500" />
+              <p className="text-lg font-medium">2FA Enabled Successfully!</p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {qrCode && (
+                <div className="flex flex-col items-center space-y-4">
+                  <div className="rounded-lg border bg-white p-4">
+                    <QRCodeSVG value={qrCode} size={200} />
+                  </div>
+                  
+                  <div className="w-full space-y-2">
+                    <p className="text-sm text-gray-600">
+                      Can't scan? Enter this code manually:
+                    </p>
+                    <code className="block rounded bg-gray-100 p-2 text-xs">
+                      {secret}
+                    </code>
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <Label htmlFor="code">Verification Code</Label>
+                <Input
+                  id="code"
+                  type="text"
+                  placeholder="000000"
+                  value={verificationCode}
+                  onChange={(e) => setVerificationCode(e.target.value)}
+                  maxLength={6}
+                />
+                <p className="text-xs text-gray-500">
+                  Enter the 6-digit code from your authenticator app
+                </p>
+              </div>
+
+              {error && (
+                <Alert variant="destructive">
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
+
+              <div className="flex space-x-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setShowSetup(false)}
+                  className="flex-1"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={verify2FA}
+                  disabled={loading || verificationCode.length !== 6}
+                  className="flex-1"
+                >
+                  {loading && <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />}
+                  Verify
+                </Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+// src/components/auth/session-list.tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+import { formatDistanceToNow } from 'date-fns'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Icons } from '@/components/ui/icons'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+
+interface Session {
+  id: string
+  user_agent?: string
+  ip_address?: string
+  created_at: string
+  last_used_at?: string
+}
+
+export function SessionList() {
+  const [sessions, setSessions] = useState<Session[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+
+  useEffect(() => {
+    fetchSessions()
+  }, [])
+
+  const fetchSessions = async () => {
+    try {
+      const response = await fetch('/api/auth/sessions')
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to fetch sessions')
+      }
+
+      setSessions(data)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const revokeSession = async (sessionId: string) => {
+    setDeletingId(sessionId)
+    setError(null)
+
+    try {
+      const response = await fetch(`/api/auth/sessions?id=${sessionId}`, {
+        method: 'DELETE',
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to revoke session')
+      }
+
+      setSessions(sessions.filter(s => s.id !== sessionId))
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const parseUserAgent = (userAgent?: string) => {
+    if (!userAgent) return 'Unknown device'
+    
+    // Simple parser - in production, use a proper user agent parser
+    if (userAgent.includes('Chrome')) return 'Chrome'
+    if (userAgent.includes('Firefox')) return 'Firefox'
+    if (userAgent.includes('Safari')) return 'Safari'
+    if (userAgent.includes('Edge')) return 'Edge'
+    return 'Unknown browser'
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Active Sessions</CardTitle>
+        <CardDescription>
+          Manage your active sessions and sign out from other devices
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <div className="flex items-center justify-center py-8">
+            <Icons.spinner className="h-8 w-8 animate-spin text-gray-400" />
+          </div>
+        ) : error ? (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        ) : sessions.length === 0 ? (
+          <p className="text-center text-sm text-gray-500 py-8">
+            No active sessions found
+          </p>
+        ) : (
+          <div className="space-y-4">
+            {sessions.map((session, index) => (
+              <div
+                key={session.id}
+                className="flex items-center justify-between rounded-lg border p-4"
+              >
+                <div className="space-y-1">
+                  <div className="flex items-center space-x-2">
+                    <Icons.laptop className="h-4 w-4 text-gray-500" />
+                    <span className="text-sm font-medium">
+                      {parseUserAgent(session.user_agent)}
+                    </span>
+                    {index === 0 && (
+                      <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700">
+                        Current
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-500">
+                    {session.ip_address || 'Unknown IP'} •{' '}
+                    {formatDistanceToNow(new Date(session.created_at), {
+                      addSuffix: true,
+                    })}
+                  </p>
+                </div>
+                {index !== 0 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => revokeSession(session.id)}
+                    disabled={deletingId === session.id}
+                  >
+                    {deletingId === session.id ? (
+                      <Icons.spinner className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Icons.logout className="h-4 w-4" />
+                    )}
+                    <span className="sr-only">Revoke session</span>
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
