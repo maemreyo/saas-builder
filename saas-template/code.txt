@@ -1,1001 +1,8 @@
-// src/lib/billing/service.ts
-import { stripe } from '@/lib/payments/stripe'
-import { createClient } from '@/lib/supabase/server'
-import Stripe from 'stripe'
-
-export class BillingService {
-  // Create or get Stripe customer
-  static async createOrGetCustomer(userId: string, email: string) {
-    const supabase = createClient()
-    
-    // Check if user already has a Stripe customer ID
-    const { data: user } = await supabase
-      .from('users')
-      .select('stripe_customer_id')
-      .eq('id', userId)
-      .single()
-
-    if (user?.stripe_customer_id) {
-      return user.stripe_customer_id
-    }
-
-    // Create new Stripe customer
-    const customer = await stripe.customers.create({
-      email,
-      metadata: {
-        userId,
-      },
-    })
-
-    // Update user with Stripe customer ID
-    await supabase
-      .from('users')
-      .update({ stripe_customer_id: customer.id })
-      .eq('id', userId)
-
-    return customer.id
-  }
-
-  // Create checkout session
-  static async createCheckoutSession({
-    userId,
-    email,
-    priceId,
-    successUrl,
-    cancelUrl,
-    metadata = {},
-  }: {
-    userId: string
-    email: string
-    priceId: string
-    successUrl: string
-    cancelUrl: string
-    metadata?: Record<string, string>
-  }) {
-    const customerId = await this.createOrGetCustomer(userId, email)
-
-    const session = await stripe.checkout.sessions.create({
-      customer: customerId,
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      mode: 'subscription',
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      metadata: {
-        userId,
-        ...metadata,
-      },
-      subscription_data: {
-        metadata: {
-          userId,
-          ...metadata,
-        },
-      },
-      allow_promotion_codes: true,
-      billing_address_collection: 'required',
-      customer_update: {
-        address: 'auto',
-      },
-    })
-
-    return session
-  }
-
-  // Create billing portal session
-  static async createPortalSession({
-    customerId,
-    returnUrl,
-  }: {
-    customerId: string
-    returnUrl: string
-  }) {
-    const session = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: returnUrl,
-    })
-
-    return session
-  }
-
-  // Get user's subscription
-  static async getSubscription(userId: string) {
-    const supabase = createClient()
-    
-    const { data } = await supabase
-      .from('subscriptions')
-      .select('*')
-      .or(`user_id.eq.${userId}`)
-      .eq('status', 'active')
-      .single()
-
-    return data
-  }
-
-  // Get user's subscriptions (including inactive)
-  static async getSubscriptions(userId: string) {
-    const supabase = createClient()
-    
-    const { data } = await supabase
-      .from('subscriptions')
-      .select('*')
-      .or(`user_id.eq.${userId}`)
-      .order('created_at', { ascending: false })
-
-    return data || []
-  }
-
-  // Cancel subscription
-  static async cancelSubscription(subscriptionId: string) {
-    const subscription = await stripe.subscriptions.update(subscriptionId, {
-      cancel_at_period_end: true,
-    })
-
-    return subscription
-  }
-
-  // Resume subscription
-  static async resumeSubscription(subscriptionId: string) {
-    const subscription = await stripe.subscriptions.update(subscriptionId, {
-      cancel_at_period_end: false,
-    })
-
-    return subscription
-  }
-
-  // Update subscription
-  static async updateSubscription(subscriptionId: string, newPriceId: string) {
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId)
-    
-    const updatedSubscription = await stripe.subscriptions.update(subscriptionId, {
-      items: [
-        {
-          id: subscription.items.data[0].id,
-          price: newPriceId,
-        },
-      ],
-      proration_behavior: 'create_prorations',
-    })
-
-    return updatedSubscription
-  }
-
-  // Get invoices
-  static async getInvoices(customerId: string, limit = 10) {
-    const invoices = await stripe.invoices.list({
-      customer: customerId,
-      limit,
-    })
-
-    return invoices.data
-  }
-
-  // Get upcoming invoice
-  static async getUpcomingInvoice(customerId: string) {
-    try {
-      const invoice = await stripe.invoices.retrieveUpcoming({
-        customer: customerId,
-      })
-      return invoice
-    } catch (error) {
-      // No upcoming invoice
-      return null
-    }
-  }
-
-  // Add payment method
-  static async addPaymentMethod(customerId: string, paymentMethodId: string) {
-    await stripe.paymentMethods.attach(paymentMethodId, {
-      customer: customerId,
-    })
-
-    // Set as default payment method
-    await stripe.customers.update(customerId, {
-      invoice_settings: {
-        default_payment_method: paymentMethodId,
-      },
-    })
-  }
-
-  // Get payment methods
-  static async getPaymentMethods(customerId: string) {
-    const paymentMethods = await stripe.paymentMethods.list({
-      customer: customerId,
-      type: 'card',
-    })
-
-    return paymentMethods.data
-  }
-
-  // Remove payment method
-  static async removePaymentMethod(paymentMethodId: string) {
-    await stripe.paymentMethods.detach(paymentMethodId)
-  }
-
-  // Create setup intent for adding payment methods
-  static async createSetupIntent(customerId: string) {
-    const setupIntent = await stripe.setupIntents.create({
-      customer: customerId,
-      payment_method_types: ['card'],
-    })
-
-    return setupIntent
-  }
-
-  // Handle webhook events
-  static async handleWebhookEvent(event: Stripe.Event) {
-    const supabase = createClient()
-
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = event.data.object as Stripe.Checkout.Session
-        
-        if (session.mode === 'subscription') {
-          const subscription = await stripe.subscriptions.retrieve(
-            session.subscription as string
-          )
-
-          await supabase.from('subscriptions').insert({
-            user_id: session.metadata?.userId,
-            organization_id: session.metadata?.organizationId,
-            stripe_subscription_id: subscription.id,
-            stripe_price_id: subscription.items.data[0].price.id,
-            stripe_current_period_end: new Date(
-              subscription.current_period_end * 1000
-            ).toISOString(),
-            status: subscription.status.toUpperCase() as any,
-            metadata: subscription.metadata,
-          })
-        }
-        break
-      }
-
-      case 'customer.subscription.updated': {
-        const subscription = event.data.object as Stripe.Subscription
-        
-        await supabase
-          .from('subscriptions')
-          .update({
-            stripe_price_id: subscription.items.data[0].price.id,
-            status: subscription.status.toUpperCase() as any,
-            stripe_current_period_end: new Date(
-              subscription.current_period_end * 1000
-            ).toISOString(),
-            cancel_at_period_end: subscription.cancel_at_period_end,
-            metadata: subscription.metadata,
-          })
-          .eq('stripe_subscription_id', subscription.id)
-        break
-      }
-
-      case 'customer.subscription.deleted': {
-        const subscription = event.data.object as Stripe.Subscription
-        
-        await supabase
-          .from('subscriptions')
-          .update({ 
-            status: 'CANCELED',
-            canceled_at: new Date().toISOString(),
-          })
-          .eq('stripe_subscription_id', subscription.id)
-        break
-      }
-
-      case 'invoice.payment_succeeded': {
-        const invoice = event.data.object as Stripe.Invoice
-        
-        // You can log successful payments or send receipts here
-        console.log(`Payment succeeded for invoice ${invoice.id}`)
-        break
-      }
-
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object as Stripe.Invoice
-        
-        // Handle failed payments - send emails, update UI, etc.
-        console.log(`Payment failed for invoice ${invoice.id}`)
-        
-        // Update subscription status
-        if (invoice.subscription) {
-          await supabase
-            .from('subscriptions')
-            .update({ status: 'PAST_DUE' })
-            .eq('stripe_subscription_id', invoice.subscription)
-        }
-        break
-      }
-    }
-  }
-
-  // Get subscription price details
-  static async getPriceDetails(priceId: string) {
-    const price = await stripe.prices.retrieve(priceId, {
-      expand: ['product'],
-    })
-
-    return {
-      id: price.id,
-      amount: price.unit_amount || 0,
-      currency: price.currency,
-      interval: price.recurring?.interval,
-      intervalCount: price.recurring?.interval_count,
-      product: price.product as Stripe.Product,
-    }
-  }
-
-  // Check if user has active subscription
-  static async hasActiveSubscription(userId: string): Promise<boolean> {
-    const subscription = await this.getSubscription(userId)
-    return !!subscription && subscription.status === 'ACTIVE'
-  }
-
-  // Get subscription limits
-  static async getSubscriptionLimits(userId: string) {
-    const subscription = await this.getSubscription(userId)
-    
-    if (!subscription) {
-      // Return free tier limits
-      return {
-        tier: 'free',
-        limits: {
-          users: 1,
-          projects: 10,
-          storage: 1024 * 1024 * 100, // 100MB
-          apiCalls: 1000,
-        },
-      }
-    }
-
-    // Get price details to determine tier
-    const priceDetails = await this.getPriceDetails(subscription.stripe_price_id)
-    
-    // Map price IDs to tiers (you'll need to configure these)
-    const tierMap: Record<string, any> = {
-      [process.env.NEXT_PUBLIC_STRIPE_PRO_PRICE_ID!]: {
-        tier: 'pro',
-        limits: {
-          users: -1, // unlimited
-          projects: -1,
-          storage: 1024 * 1024 * 1024 * 10, // 10GB
-          apiCalls: -1,
-        },
-      },
-      // Add more tiers as needed
-    }
-
-    return tierMap[subscription.stripe_price_id] || {
-      tier: 'unknown',
-      limits: {},
-    }
-  }
-}
-
-
-// src/hooks/use-billing.ts
-'use client'
-
-import { useEffect, useState, useCallback } from 'react'
-import { useRouter } from 'next/navigation'
-import { useAuth } from './use-auth'
-import { createClient } from '@/lib/supabase/client'
-
-interface Subscription {
-  id: string
-  user_id?: string
-  organization_id?: string
-  stripe_subscription_id: string
-  stripe_price_id: string
-  stripe_current_period_end: string
-  status: string
-  cancel_at_period_end: boolean
-  metadata?: any
-  created_at: string
-  updated_at: string
-}
-
-interface PaymentMethod {
-  id: string
-  brand: string
-  last4: string
-  exp_month: number
-  exp_year: number
-  is_default: boolean
-}
-
-interface Invoice {
-  id: string
-  amount_paid: number
-  amount_due: number
-  currency: string
-  status: string
-  created: number
-  invoice_pdf?: string
-  hosted_invoice_url?: string
-}
-
-export function useBilling() {
-  const { user } = useAuth()
-  const [subscription, setSubscription] = useState<Subscription | null>(null)
-  const [paymentMethods, setPaymentMethods] = useState<PaymentMethod[]>([])
-  const [invoices, setInvoices] = useState<Invoice[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const router = useRouter()
-  const supabase = createClient()
-
-  useEffect(() => {
-    if (user) {
-      fetchBillingData()
-    } else {
-      setSubscription(null)
-      setPaymentMethods([])
-      setInvoices([])
-      setLoading(false)
-    }
-  }, [user])
-
-  const fetchBillingData = async () => {
-    setLoading(true)
-    setError(null)
-
-    try {
-      // Fetch subscription
-      const { data: subData } = await supabase
-        .from('subscriptions')
-        .select('*')
-        .eq('user_id', user!.id)
-        .eq('status', 'ACTIVE')
-        .single()
-
-      setSubscription(subData)
-
-      // Fetch payment methods and invoices from API
-      if (subData) {
-        const [methodsRes, invoicesRes] = await Promise.all([
-          fetch('/api/billing/payment-methods'),
-          fetch('/api/billing/invoices'),
-        ])
-
-        if (methodsRes.ok) {
-          const methodsData = await methodsRes.json()
-          setPaymentMethods(methodsData)
-        }
-
-        if (invoicesRes.ok) {
-          const invoicesData = await invoicesRes.json()
-          setInvoices(invoicesData)
-        }
-      }
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const subscribe = useCallback(
-    async (priceId: string) => {
-      setError(null)
-
-      try {
-        const response = await fetch('/api/billing/create-checkout', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            priceId,
-            successUrl: `${window.location.origin}/billing/success`,
-            cancelUrl: `${window.location.origin}/billing`,
-          }),
-        })
-
-        const data = await response.json()
-
-        if (!response.ok) {
-          throw new Error(data.error || 'Failed to create checkout session')
-        }
-
-        // Redirect to Stripe Checkout
-        window.location.href = data.url
-      } catch (err: any) {
-        setError(err.message)
-        throw err
-      }
-    },
-    []
-  )
-
-  const updateSubscription = useCallback(
-    async (newPriceId: string) => {
-      if (!subscription) {
-        throw new Error('No active subscription')
-      }
-
-      setError(null)
-
-      try {
-        const response = await fetch('/api/billing/update-subscription', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            subscriptionId: subscription.stripe_subscription_id,
-            priceId: newPriceId,
-          }),
-        })
-
-        const data = await response.json()
-
-        if (!response.ok) {
-          throw new Error(data.error || 'Failed to update subscription')
-        }
-
-        await fetchBillingData()
-        return data
-      } catch (err: any) {
-        setError(err.message)
-        throw err
-      }
-    },
-    [subscription]
-  )
-
-  const cancelSubscription = useCallback(async () => {
-    if (!subscription) {
-      throw new Error('No active subscription')
-    }
-
-    setError(null)
-
-    try {
-      const response = await fetch('/api/billing/cancel-subscription', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          subscriptionId: subscription.stripe_subscription_id,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to cancel subscription')
-      }
-
-      await fetchBillingData()
-      return data
-    } catch (err: any) {
-      setError(err.message)
-      throw err
-    }
-  }, [subscription])
-
-  const resumeSubscription = useCallback(async () => {
-    if (!subscription) {
-      throw new Error('No subscription to resume')
-    }
-
-    setError(null)
-
-    try {
-      const response = await fetch('/api/billing/resume-subscription', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          subscriptionId: subscription.stripe_subscription_id,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to resume subscription')
-      }
-
-      await fetchBillingData()
-      return data
-    } catch (err: any) {
-      setError(err.message)
-      throw err
-    }
-  }, [subscription])
-
-  const openBillingPortal = useCallback(async () => {
-    setError(null)
-
-    try {
-      const response = await fetch('/api/billing/create-portal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          returnUrl: window.location.href,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to open billing portal')
-      }
-
-      // Redirect to Stripe Customer Portal
-      window.location.href = data.url
-    } catch (err: any) {
-      setError(err.message)
-      throw err
-    }
-  }, [])
-
-  const addPaymentMethod = useCallback(async () => {
-    setError(null)
-
-    try {
-      const response = await fetch('/api/billing/create-setup-intent', {
-        method: 'POST',
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to create setup intent')
-      }
-
-      // You would typically use Stripe Elements here
-      // For now, redirect to billing portal
-      await openBillingPortal()
-    } catch (err: any) {
-      setError(err.message)
-      throw err
-    }
-  }, [openBillingPortal])
-
-  const removePaymentMethod = useCallback(
-    async (paymentMethodId: string) => {
-      setError(null)
-
-      try {
-        const response = await fetch('/api/billing/remove-payment-method', {
-          method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ paymentMethodId }),
-        })
-
-        const data = await response.json()
-
-        if (!response.ok) {
-          throw new Error(data.error || 'Failed to remove payment method')
-        }
-
-        await fetchBillingData()
-      } catch (err: any) {
-        setError(err.message)
-        throw err
-      }
-    },
-    []
-  )
-
-  const isSubscribed = subscription?.status === 'ACTIVE'
-  const isCanceled = subscription?.cancel_at_period_end === true
-  const subscriptionEndDate = subscription?.stripe_current_period_end
-    ? new Date(subscription.stripe_current_period_end)
-    : null
-
-  return {
-    subscription,
-    paymentMethods,
-    invoices,
-    loading,
-    error,
-    isSubscribed,
-    isCanceled,
-    subscriptionEndDate,
-    subscribe,
-    updateSubscription,
-    cancelSubscription,
-    resumeSubscription,
-    openBillingPortal,
-    addPaymentMethod,
-    removePaymentMethod,
-    refreshBilling: fetchBillingData,
-  }
-}
-
-// src/hooks/use-subscription-limits.ts
-'use client'
-
-import { useEffect, useState } from 'react'
-import { useAuth } from './use-auth'
-
-interface SubscriptionLimits {
-  tier: string
-  limits: {
-    users?: number
-    projects?: number
-    storage?: number
-    apiCalls?: number
-    [key: string]: any
-  }
-}
-
-interface Usage {
-  users: number
-  projects: number
-  storage: number
-  apiCalls: number
-}
-
-export function useSubscriptionLimits() {
-  const { user } = useAuth()
-  const [limits, setLimits] = useState<SubscriptionLimits | null>(null)
-  const [usage, setUsage] = useState<Usage | null>(null)
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    if (user) {
-      fetchLimitsAndUsage()
-    } else {
-      setLimits(null)
-      setUsage(null)
-      setLoading(false)
-    }
-  }, [user])
-
-  const fetchLimitsAndUsage = async () => {
-    setLoading(true)
-
-    try {
-      const response = await fetch('/api/billing/limits')
-      const data = await response.json()
-
-      if (response.ok) {
-        setLimits(data.limits)
-        setUsage(data.usage)
-      }
-    } catch (error) {
-      console.error('Failed to fetch limits:', error)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const checkLimit = (resource: keyof Usage): boolean => {
-    if (!limits || !usage) return true
-    
-    const limit = limits.limits[resource]
-    if (limit === -1) return true // Unlimited
-    
-    return usage[resource] < limit
-  }
-
-  const getUsagePercentage = (resource: keyof Usage): number => {
-    if (!limits || !usage) return 0
-    
-    const limit = limits.limits[resource]
-    if (!limit || limit === -1) return 0
-    
-    return Math.round((usage[resource] / limit) * 100)
-  }
-
-  return {
-    limits,
-    usage,
-    loading,
-    checkLimit,
-    getUsagePercentage,
-    isFreeTier: limits?.tier === 'free',
-    isPro: limits?.tier === 'pro',
-    isEnterprise: limits?.tier === 'enterprise',
-  }
-}
-
-
-
-// src/app/api/billing/create-checkout/route.ts
+// src/app/api/organizations/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
+import { OrganizationService, createOrganizationSchema } from '@/lib/organizations/service'
 import { z } from 'zod'
-
-const createCheckoutSchema = z.object({
-  priceId: z.string(),
-  successUrl: z.string().url(),
-  cancelUrl: z.string().url(),
-  organizationId: z.string().optional(),
-})
-
-export async function POST(request: Request) {
-  try {
-    const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-    
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const body = await request.json()
-    const { priceId, successUrl, cancelUrl, organizationId } = createCheckoutSchema.parse(body)
-
-    const session = await BillingService.createCheckoutSession({
-      userId: user.id,
-      email: user.email!,
-      priceId,
-      successUrl,
-      cancelUrl,
-      metadata: organizationId ? { organizationId } : {},
-    })
-
-    return NextResponse.json({ url: session.url })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
-    }
-    
-    console.error('Checkout error:', error)
-    return NextResponse.json({ error: 'Failed to create checkout session' }, { status: 500 })
-  }
-}
-
-// src/app/api/billing/create-portal/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
-import { z } from 'zod'
-
-const createPortalSchema = z.object({
-  returnUrl: z.string().url(),
-})
-
-export async function POST(request: Request) {
-  try {
-    const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-    
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    // Get user's Stripe customer ID
-    const { data: userData } = await supabase
-      .from('users')
-      .select('stripe_customer_id')
-      .eq('id', user.id)
-      .single()
-
-    if (!userData?.stripe_customer_id) {
-      return NextResponse.json({ error: 'No billing account found' }, { status: 404 })
-    }
-
-    const body = await request.json()
-    const { returnUrl } = createPortalSchema.parse(body)
-
-    const session = await BillingService.createPortalSession({
-      customerId: userData.stripe_customer_id,
-      returnUrl,
-    })
-
-    return NextResponse.json({ url: session.url })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
-    }
-    
-    console.error('Portal error:', error)
-    return NextResponse.json({ error: 'Failed to create portal session' }, { status: 500 })
-  }
-}
-
-// src/app/api/billing/cancel-subscription/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
-import { z } from 'zod'
-
-const cancelSubscriptionSchema = z.object({
-  subscriptionId: z.string(),
-})
-
-export async function POST(request: Request) {
-  try {
-    const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-    
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const body = await request.json()
-    const { subscriptionId } = cancelSubscriptionSchema.parse(body)
-
-    // Verify user owns this subscription
-    const { data: subscription } = await supabase
-      .from('subscriptions')
-      .select('*')
-      .eq('stripe_subscription_id', subscriptionId)
-      .eq('user_id', user.id)
-      .single()
-
-    if (!subscription) {
-      return NextResponse.json({ error: 'Subscription not found' }, { status: 404 })
-    }
-
-    const updatedSubscription = await BillingService.cancelSubscription(subscriptionId)
-
-    // Update local database
-    await supabase
-      .from('subscriptions')
-      .update({ cancel_at_period_end: true })
-      .eq('stripe_subscription_id', subscriptionId)
-
-    return NextResponse.json({ subscription: updatedSubscription })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
-    }
-    
-    console.error('Cancel subscription error:', error)
-    return NextResponse.json({ error: 'Failed to cancel subscription' }, { status: 500 })
-  }
-}
-
-// src/app/api/billing/resume-subscription/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
-import { z } from 'zod'
-
-const resumeSubscriptionSchema = z.object({
-  subscriptionId: z.string(),
-})
-
-export async function POST(request: Request) {
-  try {
-    const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-    
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const body = await request.json()
-    const { subscriptionId } = resumeSubscriptionSchema.parse(body)
-
-    // Verify user owns this subscription
-    const { data: subscription } = await supabase
-      .from('subscriptions')
-      .select('*')
-      .eq('stripe_subscription_id', subscriptionId)
-      .eq('user_id', user.id)
-      .single()
-
-    if (!subscription) {
-      return NextResponse.json({ error: 'Subscription not found' }, { status: 404 })
-    }
-
-    const updatedSubscription = await BillingService.resumeSubscription(subscriptionId)
-
-    // Update local database
-    await supabase
-      .from('subscriptions')
-      .update({ cancel_at_period_end: false })
-      .eq('stripe_subscription_id', subscriptionId)
-
-    return NextResponse.json({ subscription: updatedSubscription })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
-    }
-    
-    console.error('Resume subscription error:', error)
-    return NextResponse.json({ error: 'Failed to resume subscription' }, { status: 500 })
-  }
-}
-
-// src/app/api/billing/invoices/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
 
 export async function GET() {
   try {
@@ -1006,44 +13,14 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Get user's Stripe customer ID
-    const { data: userData } = await supabase
-      .from('users')
-      .select('stripe_customer_id')
-      .eq('id', user.id)
-      .single()
-
-    if (!userData?.stripe_customer_id) {
-      return NextResponse.json([])
-    }
-
-    const invoices = await BillingService.getInvoices(userData.stripe_customer_id)
-
-    // Format invoices for frontend
-    const formattedInvoices = invoices.map(invoice => ({
-      id: invoice.id,
-      amount_paid: invoice.amount_paid,
-      amount_due: invoice.amount_due,
-      currency: invoice.currency,
-      status: invoice.status,
-      created: invoice.created,
-      invoice_pdf: invoice.invoice_pdf,
-      hosted_invoice_url: invoice.hosted_invoice_url,
-    }))
-
-    return NextResponse.json(formattedInvoices)
-  } catch (error) {
-    console.error('Get invoices error:', error)
-    return NextResponse.json({ error: 'Failed to get invoices' }, { status: 500 })
+    const organizations = await OrganizationService.getUserOrganizations(user.id)
+    return NextResponse.json(organizations)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
-// src/app/api/billing/payment-methods/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
-
-export async function GET() {
+export async function POST(request: Request) {
   try {
     const supabase = createClient()
     const { data: { user } } = await supabase.auth.getUser()
@@ -1052,47 +29,31 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Get user's Stripe customer ID
-    const { data: userData } = await supabase
-      .from('users')
-      .select('stripe_customer_id')
-      .eq('id', user.id)
-      .single()
+    const body = await request.json()
+    const data = createOrganizationSchema.parse(body)
 
-    if (!userData?.stripe_customer_id) {
-      return NextResponse.json([])
+    const organization = await OrganizationService.createOrganization(data, user.id)
+    return NextResponse.json(organization)
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
     }
-
-    const paymentMethods = await BillingService.getPaymentMethods(userData.stripe_customer_id)
-
-    // Get default payment method
-    const { stripe } = await import('@/lib/payments/stripe')
-    const customer = await stripe.customers.retrieve(userData.stripe_customer_id)
-    const defaultPaymentMethodId = (customer as any).invoice_settings?.default_payment_method
-
-    // Format payment methods for frontend
-    const formattedMethods = paymentMethods.map(method => ({
-      id: method.id,
-      brand: method.card?.brand || 'unknown',
-      last4: method.card?.last4 || '****',
-      exp_month: method.card?.exp_month || 0,
-      exp_year: method.card?.exp_year || 0,
-      is_default: method.id === defaultPaymentMethodId,
-    }))
-
-    return NextResponse.json(formattedMethods)
-  } catch (error) {
-    console.error('Get payment methods error:', error)
-    return NextResponse.json({ error: 'Failed to get payment methods' }, { status: 500 })
+    
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
-// src/app/api/billing/limits/route.ts
+// src/app/api/organizations/[orgId]/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { BillingService } from '@/lib/billing/service'
+import { OrganizationService, updateOrganizationSchema } from '@/lib/organizations/service'
+import { z } from 'zod'
 
-export async function GET() {
+interface Params {
+  params: { orgId: string }
+}
+
+export async function GET(request: Request, { params }: Params) {
   try {
     const supabase = createClient()
     const { data: { user } } = await supabase.auth.getUser()
@@ -1101,44 +62,489 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Get subscription limits
-    const limits = await BillingService.getSubscriptionLimits(user.id)
-
-    // Get current usage (implement based on your needs)
-    const usage = {
-      users: 1, // Get from database
-      projects: 0, // Get from database
-      storage: 0, // Get from storage service
-      apiCalls: 0, // Get from analytics/logs
+    const organization = await OrganizationService.getOrganization(params.orgId)
+    
+    // Check if user is a member
+    const role = await OrganizationService.getUserRole(organization.id, user.id)
+    if (!role) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     }
 
-    return NextResponse.json({ limits, usage })
-  } catch (error) {
-    console.error('Get limits error:', error)
-    return NextResponse.json({ error: 'Failed to get limits' }, { status: 500 })
+    return NextResponse.json(organization)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+export async function PATCH(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Check permissions
+    const canManage = await OrganizationService.canUserPerformAction(
+      params.orgId,
+      user.id,
+      'manage_members' // Admins can update org details
+    )
+
+    if (!canManage) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const body = await request.json()
+    const data = updateOrganizationSchema.parse(body)
+
+    const organization = await OrganizationService.updateOrganization(params.orgId, data)
+    return NextResponse.json(organization)
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
+    }
+    
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+export async function DELETE(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Check permissions
+    const canDelete = await OrganizationService.canUserPerformAction(
+      params.orgId,
+      user.id,
+      'delete_organization'
+    )
+
+    if (!canDelete) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    await OrganizationService.deleteOrganization(params.orgId)
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+// src/app/api/organizations/[orgId]/members/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { OrganizationService } from '@/lib/organizations/service'
+
+interface Params {
+  params: { orgId: string }
+}
+
+export async function GET(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Check if user is a member
+    const role = await OrganizationService.getUserRole(params.orgId, user.id)
+    if (!role) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const members = await OrganizationService.getMembers(params.orgId)
+    return NextResponse.json(members)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+// src/app/api/organizations/[orgId]/members/invite/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { OrganizationService, inviteMemberSchema } from '@/lib/organizations/service'
+import { z } from 'zod'
+
+interface Params {
+  params: { orgId: string }
+}
+
+export async function POST(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Check permissions
+    const canManage = await OrganizationService.canUserPerformAction(
+      params.orgId,
+      user.id,
+      'manage_members'
+    )
+
+    if (!canManage) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const body = await request.json()
+    const data = inviteMemberSchema.parse(body)
+
+    const invite = await OrganizationService.inviteMember(params.orgId, data, user.id)
+    return NextResponse.json(invite)
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
+    }
+    
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+// src/app/api/organizations/[orgId]/members/[userId]/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { OrganizationService } from '@/lib/organizations/service'
+
+interface Params {
+  params: { orgId: string; userId: string }
+}
+
+export async function DELETE(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Check permissions
+    const canManage = await OrganizationService.canUserPerformAction(
+      params.orgId,
+      user.id,
+      'manage_members'
+    )
+
+    // Users can remove themselves
+    if (!canManage && params.userId !== user.id) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    await OrganizationService.removeMember(params.orgId, params.userId)
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+// src/app/api/organizations/[orgId]/members/[userId]/role/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { OrganizationService } from '@/lib/organizations/service'
+import { z } from 'zod'
+
+interface Params {
+  params: { orgId: string; userId: string }
+}
+
+const updateRoleSchema = z.object({
+  role: z.enum(['OWNER', 'ADMIN', 'MEMBER']),
+})
+
+export async function PATCH(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Check permissions - only owners can change roles
+    const userRole = await OrganizationService.getUserRole(params.orgId, user.id)
+    if (userRole !== 'OWNER') {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const body = await request.json()
+    const { role } = updateRoleSchema.parse(body)
+
+    await OrganizationService.updateMemberRole(params.orgId, params.userId, role)
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
+    }
+    
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+// src/app/api/invites/[token]/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { OrganizationService } from '@/lib/organizations/service'
+
+interface Params {
+  params: { token: string }
+}
+
+export async function GET(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    
+    // Get invite details
+    const { data: invite, error } = await supabase
+      .from('organization_invites')
+      .select(`
+        *,
+        organization:organizations(name, slug)
+      `)
+      .eq('token', params.token)
+      .gte('expires_at', new Date().toISOString())
+      .single()
+
+    if (error || !invite) {
+      return NextResponse.json({ error: 'Invalid or expired invitation' }, { status: 404 })
+    }
+
+    return NextResponse.json(invite)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+export async function POST(request: Request, { params }: Params) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const result = await OrganizationService.acceptInvite(params.token, user.id)
+    return NextResponse.json(result)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
 
-// src/app/(dashboard)/billing/page.tsx
+
+
+
+-- supabase/migrations/20240103000000_create_organizations_and_invites.sql
+
+-- Create organization invites table
+CREATE TABLE IF NOT EXISTS organization_invites (
+  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  email VARCHAR(255) NOT NULL,
+  role org_role NOT NULL DEFAULT 'MEMBER',
+  token UUID DEFAULT uuid_generate_v4() NOT NULL UNIQUE,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes
+CREATE INDEX idx_organization_invites_token ON organization_invites(token);
+CREATE INDEX idx_organization_invites_organization_id ON organization_invites(organization_id);
+CREATE INDEX idx_organization_invites_email ON organization_invites(email);
+CREATE INDEX idx_organization_invites_expires_at ON organization_invites(expires_at);
+
+-- Create composite index for member lookup
+CREATE INDEX idx_organization_members_org_user ON organization_members(organization_id, user_id);
+
+-- Add RLS policies for organizations
+ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
+
+-- Users can view organizations they're members of
+CREATE POLICY "Users can view their organizations" ON organizations
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_members.organization_id = organizations.id
+      AND organization_members.user_id = auth.uid()
+    )
+  );
+
+-- Only admins and owners can update organizations
+CREATE POLICY "Admins can update organizations" ON organizations
+  FOR UPDATE USING (
+    EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_members.organization_id = organizations.id
+      AND organization_members.user_id = auth.uid()
+      AND organization_members.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Only owners can delete organizations
+CREATE POLICY "Owners can delete organizations" ON organizations
+  FOR DELETE USING (
+    EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_members.organization_id = organizations.id
+      AND organization_members.user_id = auth.uid()
+      AND organization_members.role = 'OWNER'
+    )
+  );
+
+-- Add RLS policies for organization_members
+ALTER TABLE organization_members ENABLE ROW LEVEL SECURITY;
+
+-- Members can view all members of their organizations
+CREATE POLICY "Members can view organization members" ON organization_members
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM organization_members om
+      WHERE om.organization_id = organization_members.organization_id
+      AND om.user_id = auth.uid()
+    )
+  );
+
+-- Only admins and owners can add members
+CREATE POLICY "Admins can add members" ON organization_members
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM organization_members om
+      WHERE om.organization_id = organization_members.organization_id
+      AND om.user_id = auth.uid()
+      AND om.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Only admins and owners can update members (or users can update themselves)
+CREATE POLICY "Admins can update members" ON organization_members
+  FOR UPDATE USING (
+    organization_members.user_id = auth.uid() OR
+    EXISTS (
+      SELECT 1 FROM organization_members om
+      WHERE om.organization_id = organization_members.organization_id
+      AND om.user_id = auth.uid()
+      AND om.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Only admins and owners can remove members (or users can remove themselves)
+CREATE POLICY "Admins can remove members" ON organization_members
+  FOR DELETE USING (
+    organization_members.user_id = auth.uid() OR
+    EXISTS (
+      SELECT 1 FROM organization_members om
+      WHERE om.organization_id = organization_members.organization_id
+      AND om.user_id = auth.uid()
+      AND om.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Add RLS policies for organization_invites
+ALTER TABLE organization_invites ENABLE ROW LEVEL SECURITY;
+
+-- Admins can view invites for their organizations
+CREATE POLICY "Admins can view invites" ON organization_invites
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_members.organization_id = organization_invites.organization_id
+      AND organization_members.user_id = auth.uid()
+      AND organization_members.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Admins can create invites
+CREATE POLICY "Admins can create invites" ON organization_invites
+  FOR INSERT WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_members.organization_id = organization_invites.organization_id
+      AND organization_members.user_id = auth.uid()
+      AND organization_members.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Admins can delete invites
+CREATE POLICY "Admins can delete invites" ON organization_invites
+  FOR DELETE USING (
+    EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_members.organization_id = organization_invites.organization_id
+      AND organization_members.user_id = auth.uid()
+      AND organization_members.role IN ('ADMIN', 'OWNER')
+    )
+  );
+
+-- Function to clean up expired invites
+CREATE OR REPLACE FUNCTION clean_expired_invites()
+RETURNS void AS $$
+BEGIN
+  DELETE FROM organization_invites
+  WHERE expires_at < NOW();
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create a function to ensure at least one owner exists
+CREATE OR REPLACE FUNCTION ensure_organization_has_owner()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Check if this would remove the last owner
+  IF OLD.role = 'OWNER' AND (NEW.role IS NULL OR NEW.role != 'OWNER') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM organization_members
+      WHERE organization_id = OLD.organization_id
+      AND role = 'OWNER'
+      AND id != OLD.id
+    ) THEN
+      RAISE EXCEPTION 'Cannot remove the last owner of an organization';
+    END IF;
+  END IF;
+  
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger to ensure at least one owner
+CREATE TRIGGER ensure_owner_before_update
+  BEFORE UPDATE OR DELETE ON organization_members
+  FOR EACH ROW
+  EXECUTE FUNCTION ensure_organization_has_owner();
+
+
+
+
+
+
+
+
+// src/app/(dashboard)/organization/page.tsx
 'use client'
 
 import { useState } from 'react'
-import { useBilling } from '@/hooks/use-billing'
-import { useSubscriptionLimits } from '@/hooks/use-subscription-limits'
-import { PricingTable } from '@/components/billing/pricing-table'
-import { CurrentPlan } from '@/components/billing/current-plan'
-import { PaymentMethods } from '@/components/billing/payment-methods'
-import { BillingHistory } from '@/components/billing/billing-history'
-import { UsageOverview } from '@/components/billing/usage-overview'
+import { useOrganization } from '@/hooks/use-organization'
+import { OrganizationSettings } from '@/components/organization/organization-settings'
+import { MembersList } from '@/components/organization/members-list'
+import { InvitesList } from '@/components/organization/invites-list'
+import { CreateOrganization } from '@/components/organization/create-organization'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
 import { Icons } from '@/components/ui/icons'
 
-export default function BillingPage() {
-  const { subscription, loading, error, isSubscribed } = useBilling()
-  const { limits, usage } = useSubscriptionLimits()
+export default function OrganizationPage() {
+  const { organization, loading, error, canManageMembers } = useOrganization()
 
   if (loading) {
     return (
@@ -1158,112 +564,752 @@ export default function BillingPage() {
     )
   }
 
+  if (!organization) {
+    return <CreateOrganization />
+  }
+
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-3xl font-bold">Billing & Subscription</h1>
+        <h1 className="text-3xl font-bold">{organization.name}</h1>
         <p className="text-gray-600 mt-2">
-          Manage your subscription, payment methods, and billing history
+          Manage your organization settings and team members
         </p>
       </div>
 
-      {/* Current Plan Overview */}
-      <CurrentPlan />
-
-      {/* Usage Overview */}
-      {isSubscribed && <UsageOverview />}
-
-      <Tabs defaultValue={isSubscribed ? "billing" : "plans"} className="w-full">
+      <Tabs defaultValue="members" className="w-full">
         <TabsList>
-          <TabsTrigger value="plans">Plans</TabsTrigger>
-          {isSubscribed && (
-            <>
-              <TabsTrigger value="billing">Billing</TabsTrigger>
-              <TabsTrigger value="invoices">Invoices</TabsTrigger>
-            </>
-          )}
+          <TabsTrigger value="members">Members</TabsTrigger>
+          {canManageMembers && <TabsTrigger value="invites">Invites</TabsTrigger>}
+          <TabsTrigger value="settings">Settings</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="plans" className="mt-6">
-          <div className="space-y-4">
-            <h2 className="text-xl font-semibold">Available Plans</h2>
-            <PricingTable currentPlanId={subscription?.stripe_price_id} />
-          </div>
+        <TabsContent value="members" className="mt-6">
+          <MembersList />
         </TabsContent>
 
-        {isSubscribed && (
-          <>
-            <TabsContent value="billing" className="mt-6">
-              <div className="space-y-6">
-                <PaymentMethods />
-              </div>
-            </TabsContent>
-
-            <TabsContent value="invoices" className="mt-6">
-              <BillingHistory />
-            </TabsContent>
-          </>
+        {canManageMembers && (
+          <TabsContent value="invites" className="mt-6">
+            <InvitesList />
+          </TabsContent>
         )}
+
+        <TabsContent value="settings" className="mt-6">
+          <OrganizationSettings />
+        </TabsContent>
       </Tabs>
     </div>
   )
 }
 
-// src/components/billing/current-plan.tsx
+// src/components/organization/members-list.tsx
 'use client'
 
-import { format } from 'date-fns'
-import { useBilling } from '@/hooks/use-billing'
+import { useState } from 'react'
+import { useOrganization } from '@/hooks/use-organization'
+import { useOrganizationMembers } from '@/hooks/use-organization-members'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Alert, AlertDescription } from '@/components/ui/alert'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { Icons } from '@/components/ui/icons'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 
-export function CurrentPlan() {
-  const {
-    subscription,
-    isSubscribed,
-    isCanceled,
-    subscriptionEndDate,
-    cancelSubscription,
-    resumeSubscription,
-    openBillingPortal,
-    loading,
-  } = useBilling()
+export function MembersList() {
+  const { members, currentMember, canManageMembers } = useOrganization()
+  const { inviteMember, updateMemberRole, removeMember, loading } = useOrganizationMembers()
+  const [showInviteDialog, setShowInviteDialog] = useState(false)
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteRole, setInviteRole] = useState<'MEMBER' | 'ADMIN'>('MEMBER')
 
-  const handleCancelSubscription = async () => {
-    if (!confirm('Are you sure you want to cancel your subscription?')) {
+  const handleInvite = async () => {
+    try {
+      await inviteMember(inviteEmail, inviteRole)
+      setShowInviteDialog(false)
+      setInviteEmail('')
+      setInviteRole('MEMBER')
+    } catch (error) {
+      console.error('Failed to invite member:', error)
+    }
+  }
+
+  const handleRoleChange = async (userId: string, newRole: string) => {
+    try {
+      await updateMemberRole(userId, newRole as any)
+    } catch (error) {
+      console.error('Failed to update role:', error)
+    }
+  }
+
+  const handleRemove = async (userId: string) => {
+    if (!confirm('Are you sure you want to remove this member?')) {
       return
     }
 
     try {
-      await cancelSubscription()
+      await removeMember(userId)
     } catch (error) {
-      console.error('Failed to cancel subscription:', error)
+      console.error('Failed to remove member:', error)
     }
   }
 
-  const handleResumeSubscription = async () => {
-    try {
-      await resumeSubscription()
-    } catch (error) {
-      console.error('Failed to resume subscription:', error)
+  const getRoleBadgeVariant = (role: string) => {
+    switch (role) {
+      case 'OWNER':
+        return 'default'
+      case 'ADMIN':
+        return 'secondary'
+      default:
+        return 'outline'
     }
   }
 
-  if (!isSubscribed) {
-    return (
+  return (
+    <>
       <Card>
         <CardHeader>
-          <CardTitle>Current Plan</CardTitle>
-          <CardDescription>You are currently on the free plan</CardDescription>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle>Team Members</CardTitle>
+              <CardDescription>
+                Manage your organization's team members and their roles
+              </CardDescription>
+            </div>
+            {canManageMembers && (
+              <Button onClick={() => setShowInviteDialog(true)}>
+                <Icons.add className="h-4 w-4 mr-2" />
+                Invite Member
+              </Button>
+            )}
+          </div>
         </CardHeader>
         <CardContent>
-          <p className="text-sm text-gray-600 mb-4">
-            Upgrade to a paid plan to unlock more features and remove limitations.
-          </p>
-          <Button>View Plans</Button>
+          <div className="space-y-4">
+            {members.map((member) => {
+              const isCurrentUser = member.user_id === currentMember?.user_id
+              
+              return (
+                <div
+                  key={member.id}
+                  className="flex items-center justify-between p-4 border rounded-lg"
+                >
+                  <div className="flex items-center space-x-4">
+                    <Avatar>
+                      <AvatarImage src={member.user?.avatar_url} />
+                      <AvatarFallback>
+                        {member.user?.name?.charAt(0) || member.user?.email?.charAt(0) || '?'}
+                      </AvatarFallback>
+                    </Avatar>
+                    <div>
+                      <p className="font-medium">
+                        {member.user?.name || member.user?.email}
+                        {isCurrentUser && ' (You)'}
+                      </p>
+                      <p className="text-sm text-gray-500">{member.user?.email}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Badge variant={getRoleBadgeVariant(member.role)}>
+                      {member.role}
+                    </Badge>
+                    {canManageMembers && !isCurrentUser && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="sm">
+                            <Icons.moreVertical className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {currentMember?.role === 'OWNER' && (
+                            <>
+                              <DropdownMenuItem
+                                onClick={() => handleRoleChange(member.user_id, 'MEMBER')}
+                                disabled={member.role === 'MEMBER'}
+                              >
+                                Change to Member
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() => handleRoleChange(member.user_id, 'ADMIN')}
+                                disabled={member.role === 'ADMIN'}
+                              >
+                                Change to Admin
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() => handleRoleChange(member.user_id, 'OWNER')}
+                                disabled={member.role === 'OWNER'}
+                              >
+                                Change to Owner
+                              </DropdownMenuItem>
+                            </>
+                          )}
+                          <DropdownMenuItem
+                            onClick={() => handleRemove(member.user_id)}
+                            className="text-red-600"
+                          >
+                            Remove Member
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Dialog open={showInviteDialog} onOpenChange={setShowInviteDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Invite Team Member</DialogTitle>
+            <DialogDescription>
+              Send an invitation to add a new member to your organization
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="email">Email Address</Label>
+              <Input
+                id="email"
+                type="email"
+                value={inviteEmail}
+                onChange={(e) => setInviteEmail(e.target.value)}
+                placeholder="colleague@example.com"
+              />
+            </div>
+            <div>
+              <Label htmlFor="role">Role</Label>
+              <Select value={inviteRole} onValueChange={(v) => setInviteRole(v as any)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="MEMBER">Member</SelectItem>
+                  <SelectItem value="ADMIN">Admin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowInviteDialog(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleInvite} disabled={!inviteEmail || loading}>
+              {loading ? 'Sending...' : 'Send Invitation'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+// src/components/organization/create-organization.tsx
+'use client'
+
+import { useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { useOrganizations } from '@/hooks/use-organizations'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+
+export function CreateOrganization() {
+  const router = useRouter()
+  const { createOrganization } = useOrganizations()
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [formData, setFormData] = useState({
+    name: '',
+    slug: '',
+    description: '',
+  })
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setLoading(true)
+    setError(null)
+
+    try {
+      const org = await createOrganization(formData)
+      router.push(`/org/${org.id}`)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleNameChange = (name: string) => {
+    setFormData((prev) => ({
+      ...prev,
+      name,
+      // Auto-generate slug from name
+      slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
+    }))
+  }
+
+  return (
+    <div className="max-w-2xl mx-auto">
+      <Card>
+        <CardHeader>
+          <CardTitle>Create Your Organization</CardTitle>
+          <CardDescription>
+            Set up your organization to collaborate with your team
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {error && (
+              <Alert variant="destructive">
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
+
+            <div>
+              <Label htmlFor="name">Organization Name</Label>
+              <Input
+                id="name"
+                value={formData.name}
+                onChange={(e) => handleNameChange(e.target.value)}
+                placeholder="Acme Inc."
+                required
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="slug">URL Slug</Label>
+              <Input
+                id="slug"
+                value={formData.slug}
+                onChange={(e) => setFormData({ ...formData, slug: e.target.value })}
+                placeholder="acme-inc"
+                pattern="[a-z0-9-]+"
+                required
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                This will be used in URLs: /org/{formData.slug || 'your-org'}
+              </p>
+            </div>
+
+            <div>
+              <Label htmlFor="description">Description (optional)</Label>
+              <Textarea
+                id="description"
+                value={formData.description}
+                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                placeholder="Tell us about your organization..."
+                rows={3}
+              />
+            </div>
+
+            <Button type="submit" disabled={loading} className="w-full">
+              {loading ? 'Creating...' : 'Create Organization'}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+
+
+
+
+
+
+// src/components/ui/avatar.tsx
+'use client'
+
+import * as React from "react"
+import * as AvatarPrimitive from "@radix-ui/react-avatar"
+import { cn } from "@/lib/utils"
+
+const Avatar = React.forwardRef<
+  React.ElementRef<typeof AvatarPrimitive.Root>,
+  React.ComponentPropsWithoutRef<typeof AvatarPrimitive.Root>
+>(({ className, ...props }, ref) => (
+  <AvatarPrimitive.Root
+    ref={ref}
+    className={cn(
+      "relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full",
+      className
+    )}
+    {...props}
+  />
+))
+Avatar.displayName = AvatarPrimitive.Root.displayName
+
+const AvatarImage = React.forwardRef<
+  React.ElementRef<typeof AvatarPrimitive.Image>,
+  React.ComponentPropsWithoutRef<typeof AvatarPrimitive.Image>
+>(({ className, ...props }, ref) => (
+  <AvatarPrimitive.Image
+    ref={ref}
+    className={cn("aspect-square h-full w-full", className)}
+    {...props}
+  />
+))
+AvatarImage.displayName = AvatarPrimitive.Image.displayName
+
+const AvatarFallback = React.forwardRef<
+  React.ElementRef<typeof AvatarPrimitive.Fallback>,
+  React.ComponentPropsWithoutRef<typeof AvatarPrimitive.Fallback>
+>(({ className, ...props }, ref) => (
+  <AvatarPrimitive.Fallback
+    ref={ref}
+    className={cn(
+      "flex h-full w-full items-center justify-center rounded-full bg-muted",
+      className
+    )}
+    {...props}
+  />
+))
+AvatarFallback.displayName = AvatarPrimitive.Fallback.displayName
+
+export { Avatar, AvatarImage, AvatarFallback }
+
+// src/components/ui/dropdown-menu.tsx
+'use client'
+
+import * as React from "react"
+import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu"
+import { Check, ChevronRight, Circle } from "lucide-react"
+import { cn } from "@/lib/utils"
+
+const DropdownMenu = DropdownMenuPrimitive.Root
+
+const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger
+
+const DropdownMenuGroup = DropdownMenuPrimitive.Group
+
+const DropdownMenuPortal = DropdownMenuPrimitive.Portal
+
+const DropdownMenuSub = DropdownMenuPrimitive.Sub
+
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup
+
+const DropdownMenuSubTrigger = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.SubTrigger>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubTrigger> & {
+    inset?: boolean
+  }
+>(({ className, inset, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.SubTrigger
+    ref={ref}
+    className={cn(
+      "flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent data-[state=open]:bg-accent",
+      inset && "pl-8",
+      className
+    )}
+    {...props}
+  >
+    {children}
+    <ChevronRight className="ml-auto h-4 w-4" />
+  </DropdownMenuPrimitive.SubTrigger>
+))
+DropdownMenuSubTrigger.displayName =
+  DropdownMenuPrimitive.SubTrigger.displayName
+
+const DropdownMenuSubContent = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.SubContent>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubContent>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.SubContent
+    ref={ref}
+    className={cn(
+      "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+      className
+    )}
+    {...props}
+  />
+))
+DropdownMenuSubContent.displayName =
+  DropdownMenuPrimitive.SubContent.displayName
+
+const DropdownMenuContent = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Content>
+>(({ className, sideOffset = 4, ...props }, ref) => (
+  <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.Content
+      ref={ref}
+      sideOffset={sideOffset}
+      className={cn(
+        "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        className
+      )}
+      {...props}
+    />
+  </DropdownMenuPrimitive.Portal>
+))
+DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName
+
+const DropdownMenuItem = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Item>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & {
+    inset?: boolean
+  }
+>(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      inset && "pl-8",
+      className
+    )}
+    {...props}
+  />
+))
+DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName
+
+const DropdownMenuCheckboxItem = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.CheckboxItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem>
+>(({ className, children, checked, ...props }, ref) => (
+  <DropdownMenuPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    checked={checked}
+    {...props}
+  >
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <DropdownMenuPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </DropdownMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownMenuPrimitive.CheckboxItem>
+))
+DropdownMenuCheckboxItem.displayName =
+  DropdownMenuPrimitive.CheckboxItem.displayName
+
+const DropdownMenuRadioItem = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.RadioItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.RadioItem>
+>(({ className, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    {...props}
+  >
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <DropdownMenuPrimitive.ItemIndicator>
+        <Circle className="h-2 w-2 fill-current" />
+      </DropdownMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownMenuPrimitive.RadioItem>
+))
+DropdownMenuRadioItem.displayName = DropdownMenuPrimitive.RadioItem.displayName
+
+const DropdownMenuLabel = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Label> & {
+    inset?: boolean
+  }
+>(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Label
+    ref={ref}
+    className={cn(
+      "px-2 py-1.5 text-sm font-semibold",
+      inset && "pl-8",
+      className
+    )}
+    {...props}
+  />
+))
+DropdownMenuLabel.displayName = DropdownMenuPrimitive.Label.displayName
+
+const DropdownMenuSeparator = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Separator>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Separator>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    {...props}
+  />
+))
+DropdownMenuSeparator.displayName = DropdownMenuPrimitive.Separator.displayName
+
+const DropdownMenuShortcut = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLSpanElement>) => {
+  return (
+    <span
+      className={cn("ml-auto text-xs tracking-widest opacity-60", className)}
+      {...props}
+    />
+  )
+}
+DropdownMenuShortcut.displayName = "DropdownMenuShortcut"
+
+export {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuGroup,
+  DropdownMenuPortal,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+}
+
+// src/components/ui/textarea.tsx
+import * as React from "react"
+import { cn } from "@/lib/utils"
+
+export interface TextareaProps
+  extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {}
+
+const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <textarea
+        className={cn(
+          "flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
+          className
+        )}
+        ref={ref}
+        {...props}
+      />
+    )
+  }
+)
+Textarea.displayName = "Textarea"
+
+export { Textarea }
+
+
+
+
+
+
+
+
+
+
+
+// src/components/organization/invites-list.tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+import { formatDistanceToNow } from 'date-fns'
+import { useOrganization } from '@/hooks/use-organization'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Icons } from '@/components/ui/icons'
+import { createClient } from '@/lib/supabase/client'
+
+interface PendingInvite {
+  id: string
+  email: string
+  role: 'OWNER' | 'ADMIN' | 'MEMBER'
+  created_at: string
+  expires_at: string
+  inviter?: {
+    name?: string
+    email: string
+  }
+}
+
+export function InvitesList() {
+  const { organization } = useOrganization()
+  const [invites, setInvites] = useState<PendingInvite[]>([])
+  const [loading, setLoading] = useState(true)
+  const [cancellingId, setCancellingId] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (organization) {
+      fetchInvites()
+    }
+  }, [organization])
+
+  const fetchInvites = async () => {
+    if (!organization) return
+
+    setLoading(true)
+    try {
+      const supabase = createClient()
+      const { data, error } = await supabase
+        .from('organization_invites')
+        .select(`
+          *,
+          inviter:users!organization_invites_created_by_fkey(name, email)
+        `)
+        .eq('organization_id', organization.id)
+        .gte('expires_at', new Date().toISOString())
+        .order('created_at', { ascending: false })
+
+      if (error) throw error
+      setInvites(data || [])
+    } catch (error) {
+      console.error('Failed to fetch invites:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const cancelInvite = async (inviteId: string) => {
+    setCancellingId(inviteId)
+    try {
+      const response = await fetch(`/api/organizations/${organization?.id}/invites/${inviteId}`, {
+        method: 'DELETE',
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to cancel invite')
+      }
+
+      setInvites(invites.filter((i) => i.id !== inviteId))
+    } catch (error) {
+      console.error('Failed to cancel invite:', error)
+    } finally {
+      setCancellingId(null)
+    }
+  }
+
+  const getRoleBadgeVariant = (role: string) => {
+    switch (role) {
+      case 'OWNER':
+        return 'default'
+      case 'ADMIN':
+        return 'secondary'
+      default:
+        return 'outline'
+    }
+  }
+
+  if (loading) {
+    return (
+      <Card>
+        <CardContent className="flex items-center justify-center py-8">
+          <Icons.spinner className="h-6 w-6 animate-spin text-gray-400" />
         </CardContent>
       </Card>
     )
@@ -1272,140 +1318,53 @@ export function CurrentPlan() {
   return (
     <Card>
       <CardHeader>
-        <div className="flex items-center justify-between">
-          <div>
-            <CardTitle>Current Plan</CardTitle>
-            <CardDescription>
-              {isCanceled
-                ? `Your subscription will end on ${format(subscriptionEndDate!, 'MMMM d, yyyy')}`
-                : 'Manage your subscription and billing'}
-            </CardDescription>
-          </div>
-          <Button variant="outline" onClick={openBillingPortal}>
-            <Icons.settings className="h-4 w-4 mr-2" />
-            Manage Billing
-          </Button>
-        </div>
+        <CardTitle>Pending Invitations</CardTitle>
+        <CardDescription>
+          Manage pending invitations to your organization
+        </CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-lg font-medium">Pro Plan</p>
-              <p className="text-sm text-gray-600">$29/month</p>
-            </div>
-            <Badge variant={isCanceled ? 'destructive' : 'default'}>
-              {isCanceled ? 'Canceling' : 'Active'}
-            </Badge>
-          </div>
-
-          {isCanceled && (
-            <Alert>
-              <Icons.alertCircle className="h-4 w-4" />
-              <AlertDescription>
-                Your subscription is set to cancel at the end of the current billing period.
-                You'll still have access to Pro features until {format(subscriptionEndDate!, 'MMMM d, yyyy')}.
-              </AlertDescription>
-            </Alert>
-          )}
-
-          <div className="flex space-x-2">
-            {isCanceled ? (
-              <Button onClick={handleResumeSubscription} disabled={loading}>
-                Resume Subscription
-              </Button>
-            ) : (
-              <Button variant="destructive" onClick={handleCancelSubscription} disabled={loading}>
-                Cancel Subscription
-              </Button>
-            )}
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-// src/components/billing/payment-methods.tsx
-'use client'
-
-import { useState } from 'react'
-import { useBilling } from '@/hooks/use-billing'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Icons } from '@/components/ui/icons'
-
-export function PaymentMethods() {
-  const { paymentMethods, removePaymentMethod, addPaymentMethod } = useBilling()
-  const [removingId, setRemovingId] = useState<string | null>(null)
-
-  const handleRemove = async (methodId: string) => {
-    if (!confirm('Are you sure you want to remove this payment method?')) {
-      return
-    }
-
-    setRemovingId(methodId)
-    try {
-      await removePaymentMethod(methodId)
-    } catch (error) {
-      console.error('Failed to remove payment method:', error)
-    } finally {
-      setRemovingId(null)
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <div>
-            <CardTitle>Payment Methods</CardTitle>
-            <CardDescription>Manage your payment methods</CardDescription>
-          </div>
-          <Button onClick={addPaymentMethod} size="sm">
-            <Icons.add className="h-4 w-4 mr-2" />
-            Add Method
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent>
-        {paymentMethods.length === 0 ? (
-          <p className="text-sm text-gray-500 text-center py-8">
-            No payment methods on file
+        {invites.length === 0 ? (
+          <p className="text-center text-sm text-gray-500 py-8">
+            No pending invitations
           </p>
         ) : (
-          <div className="space-y-3">
-            {paymentMethods.map((method) => (
+          <div className="space-y-4">
+            {invites.map((invite) => (
               <div
-                key={method.id}
+                key={invite.id}
                 className="flex items-center justify-between p-4 border rounded-lg"
               >
-                <div className="flex items-center space-x-3">
-                  <div className="h-8 w-12 bg-gray-100 rounded flex items-center justify-center text-xs font-medium">
-                    {method.brand.toUpperCase()}
-                  </div>
-                  <div>
-                    <p className="text-sm font-medium">•••• {method.last4}</p>
-                    <p className="text-xs text-gray-500">
-                      Expires {method.exp_month}/{method.exp_year}
-                    </p>
-                  </div>
-                  {method.is_default && (
-                    <Badge variant="secondary" className="text-xs">
-                      Default
+                <div>
+                  <p className="font-medium">{invite.email}</p>
+                  <div className="flex items-center space-x-2 mt-1">
+                    <Badge variant={getRoleBadgeVariant(invite.role)}>
+                      {invite.role}
                     </Badge>
-                  )}
+                    <span className="text-xs text-gray-500">
+                      Invited by {invite.inviter?.name || invite.inviter?.email}{' '}
+                      {formatDistanceToNow(new Date(invite.created_at), {
+                        addSuffix: true,
+                      })}
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Expires{' '}
+                    {formatDistanceToNow(new Date(invite.expires_at), {
+                      addSuffix: true,
+                    })}
+                  </p>
                 </div>
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => handleRemove(method.id)}
-                  disabled={removingId === method.id || method.is_default}
+                  onClick={() => cancelInvite(invite.id)}
+                  disabled={cancellingId === invite.id}
                 >
-                  {removingId === method.id ? (
+                  {cancellingId === invite.id ? (
                     <Icons.spinner className="h-4 w-4 animate-spin" />
                   ) : (
-                    <Icons.delete className="h-4 w-4" />
+                    'Cancel'
                   )}
                 </Button>
               </div>
@@ -1417,792 +1376,367 @@ export function PaymentMethods() {
   )
 }
 
-// src/components/billing/billing-history.tsx
+// src/components/organization/organization-settings.tsx
 'use client'
 
-import { format } from 'date-fns'
-import { useBilling } from '@/hooks/use-billing'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { useOrganization } from '@/hooks/use-organization'
 import { Button } from '@/components/ui/button'
-import { Icons } from '@/components/ui/icons'
-
-export function BillingHistory() {
-  const { invoices } = useBilling()
-
-  const formatCurrency = (amount: number, currency: string) => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: currency.toUpperCase(),
-    }).format(amount / 100)
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Billing History</CardTitle>
-        <CardDescription>Download your past invoices</CardDescription>
-      </CardHeader>
-      <CardContent>
-        {invoices.length === 0 ? (
-          <p className="text-sm text-gray-500 text-center py-8">
-            No invoices yet
-          </p>
-        ) : (
-          <div className="space-y-2">
-            {invoices.map((invoice) => (
-              <div
-                key={invoice.id}
-                className="flex items-center justify-between p-4 border rounded-lg"
-              >
-                <div>
-                  <p className="text-sm font-medium">
-                    {format(new Date(invoice.created * 1000), 'MMMM d, yyyy')}
-                  </p>
-                  <p className="text-sm text-gray-600">
-                    {formatCurrency(invoice.amount_paid, invoice.currency)}
-                  </p>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <Badge variant={invoice.status === 'paid' ? 'default' : 'secondary'}>
-                    {invoice.status}
-                  </Badge>
-                  {invoice.invoice_pdf && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      asChild
-                    >
-                      <a href={invoice.invoice_pdf} target="_blank" rel="noopener noreferrer">
-                        <Icons.download className="h-4 w-4" />
-                      </a>
-                    </Button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-
-// src/components/ui/badge.tsx
-import * as React from "react"
-import { cva, type VariantProps } from "class-variance-authority"
-import { cn } from "@/lib/utils"
-
-const badgeVariants = cva(
-  "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
-  {
-    variants: {
-      variant: {
-        default:
-          "border-transparent bg-primary text-primary-foreground hover:bg-primary/80",
-        secondary:
-          "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
-        destructive:
-          "border-transparent bg-destructive text-destructive-foreground hover:bg-destructive/80",
-        outline: "text-foreground",
-      },
-    },
-    defaultVariants: {
-      variant: "default",
-    },
-  }
-)
-
-export interface BadgeProps
-  extends React.HTMLAttributes<HTMLDivElement>,
-    VariantProps<typeof badgeVariants> {}
-
-function Badge({ className, variant, ...props }: BadgeProps) {
-  return (
-    <div className={cn(badgeVariants({ variant }), className)} {...props} />
-  )
-}
-
-export { Badge, badgeVariants }
-
-
-
-// src/components/billing/usage-overview.tsx
-'use client'
-
-import { useSubscriptionLimits } from '@/hooks/use-subscription-limits'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Progress } from '@/components/ui/progress'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Icons } from '@/components/ui/icons'
-import { cn } from '@/lib/utils'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 
-interface UsageItemProps {
-  label: string
-  used: number
-  limit: number
-  unit?: string
-}
+export function OrganizationSettings() {
+  const router = useRouter()
+  const { organization, isOwner, isAdmin, refreshOrganization } = useOrganization()
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState(false)
+  const [formData, setFormData] = useState({
+    name: organization?.name || '',
+    slug: organization?.slug || '',
+    description: organization?.description || '',
+    website: organization?.website || '',
+  })
 
-function UsageItem({ label, used, limit, unit = '' }: UsageItemProps) {
-  const percentage = limit === -1 ? 0 : Math.round((used / limit) * 100)
-  const isUnlimited = limit === -1
-  const isNearLimit = percentage >= 80 && !isUnlimited
-  const isAtLimit = percentage >= 100 && !isUnlimited
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!organization || !isAdmin) return
+
+    setLoading(true)
+    setError(null)
+    setSuccess(false)
+
+    try {
+      const response = await fetch(`/api/organizations/${organization.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to update organization')
+      }
+
+      setSuccess(true)
+      await refreshOrganization()
+      
+      // If slug changed, redirect to new URL
+      if (data.slug !== organization.slug) {
+        router.push(`/org/${data.id}/settings`)
+      }
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!organization || !isOwner) return
+
+    setLoading(true)
+    try {
+      const response = await fetch(`/api/organizations/${organization.id}`, {
+        method: 'DELETE',
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to delete organization')
+      }
+
+      router.push('/dashboard')
+    } catch (err: any) {
+      setError(err.message)
+      setLoading(false)
+    }
+  }
+
+  if (!organization) return null
 
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between text-sm">
-        <span className="font-medium">{label}</span>
-        <span className="text-gray-600">
-          {used.toLocaleString()}{unit}
-          {!isUnlimited && ` / ${limit.toLocaleString()}${unit}`}
-          {isUnlimited && ' / Unlimited'}
-        </span>
-      </div>
-      {!isUnlimited && (
-        <Progress 
-          value={percentage} 
-          className={cn(
-            "h-2",
-            isAtLimit && "bg-red-100",
-            isNearLimit && !isAtLimit && "bg-orange-100"
-          )}
-        />
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>Organization Details</CardTitle>
+          <CardDescription>
+            Update your organization's information
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {error && (
+              <Alert variant="destructive">
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
+            
+            {success && (
+              <Alert>
+                <Icons.check className="h-4 w-4" />
+                <AlertDescription>
+                  Organization updated successfully
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <div>
+              <Label htmlFor="name">Organization Name</Label>
+              <Input
+                id="name"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                disabled={!isAdmin}
+                required
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="slug">URL Slug</Label>
+              <Input
+                id="slug"
+                value={formData.slug}
+                onChange={(e) => setFormData({ ...formData, slug: e.target.value })}
+                pattern="[a-z0-9-]+"
+                disabled={!isOwner}
+                required
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                {isOwner
+                  ? 'Changing this will update all organization URLs'
+                  : 'Only owners can change the URL slug'}
+              </p>
+            </div>
+
+            <div>
+              <Label htmlFor="website">Website</Label>
+              <Input
+                id="website"
+                type="url"
+                value={formData.website}
+                onChange={(e) => setFormData({ ...formData, website: e.target.value })}
+                placeholder="https://example.com"
+                disabled={!isAdmin}
+              />
+            </div>
+
+            <div>
+              <Label htmlFor="description">Description</Label>
+              <Textarea
+                id="description"
+                value={formData.description}
+                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                rows={3}
+                disabled={!isAdmin}
+              />
+            </div>
+
+            {isAdmin && (
+              <Button type="submit" disabled={loading}>
+                {loading ? 'Saving...' : 'Save Changes'}
+              </Button>
+            )}
+          </form>
+        </CardContent>
+      </Card>
+
+      {isOwner && (
+        <Card className="border-red-200">
+          <CardHeader>
+            <CardTitle className="text-red-600">Danger Zone</CardTitle>
+            <CardDescription>
+              Irreversible actions that affect your entire organization
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button variant="destructive" disabled={loading}>
+                  Delete Organization
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Delete Organization</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    Are you absolutely sure? This action cannot be undone. This will
+                    permanently delete <strong>{organization.name}</strong> and remove
+                    all associated data.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    onClick={handleDelete}
+                    className="bg-red-600 hover:bg-red-700"
+                  >
+                    Yes, delete organization
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </CardContent>
+        </Card>
       )}
     </div>
   )
 }
 
-export function UsageOverview() {
-  const { limits, usage, loading, isFreeTier } = useSubscriptionLimits()
-
-  if (loading || !limits || !usage) {
-    return null
-  }
-
-  const hasAnyLimitWarning = Object.keys(usage).some((key) => {
-    const limit = limits.limits[key as keyof typeof usage]
-    if (!limit || limit === -1) return false
-    const percentage = (usage[key as keyof typeof usage] / limit) * 100
-    return percentage >= 80
-  })
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Usage Overview</CardTitle>
-        <CardDescription>
-          Track your usage against your plan limits
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {hasAnyLimitWarning && (
-          <Alert>
-            <Icons.alertCircle className="h-4 w-4" />
-            <AlertDescription>
-              You're approaching one or more of your plan limits. Consider upgrading to continue growing.
-            </AlertDescription>
-          </Alert>
-        )}
-
-        <div className="grid gap-4 md:grid-cols-2">
-          <UsageItem
-            label="Team Members"
-            used={usage.users}
-            limit={limits.limits.users || 0}
-          />
-          <UsageItem
-            label="Projects"
-            used={usage.projects}
-            limit={limits.limits.projects || 0}
-          />
-          <UsageItem
-            label="Storage"
-            used={Math.round(usage.storage / (1024 * 1024))} // Convert to MB
-            limit={Math.round((limits.limits.storage || 0) / (1024 * 1024))}
-            unit="MB"
-          />
-          <UsageItem
-            label="API Calls (this month)"
-            used={usage.apiCalls}
-            limit={limits.limits.apiCalls || 0}
-          />
-        </div>
-
-        {isFreeTier && (
-          <div className="rounded-lg bg-gray-50 p-4 text-center">
-            <p className="text-sm text-gray-600">
-              Upgrade to Pro to unlock unlimited usage and advanced features
-            </p>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-
-
-// src/app/(dashboard)/billing/success/page.tsx
-// Note: Install canvas-confetti: npm install canvas-confetti @types/canvas-confetti
+// src/components/ui/alert-dialog.tsx
 'use client'
 
-import { useEffect, useState } from 'react'
-import { useRouter } from 'next/navigation'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Icons } from '@/components/ui/icons'
-import confetti from 'canvas-confetti'
+import * as React from "react"
+import * as AlertDialogPrimitive from "@radix-ui/react-alert-dialog"
+import { cn } from "@/lib/utils"
+import { buttonVariants } from "@/components/ui/button"
 
-export default function BillingSuccessPage() {
-  const router = useRouter()
-  const [countdown, setCountdown] = useState(5)
+const AlertDialog = AlertDialogPrimitive.Root
 
-  useEffect(() => {
-    // Fire confetti
-    confetti({
-      particleCount: 100,
-      spread: 70,
-      origin: { y: 0.6 },
-    })
+const AlertDialogTrigger = AlertDialogPrimitive.Trigger
 
-    // Countdown timer
-    const timer = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer)
-          router.push('/dashboard')
-        }
-        return prev - 1
-      })
-    }, 1000)
+const AlertDialogPortal = AlertDialogPrimitive.Portal
 
-    return () => clearInterval(timer)
-  }, [router])
+const AlertDialogOverlay = React.forwardRef<
+  React.ElementRef<typeof AlertDialogPrimitive.Overlay>,
+  React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Overlay>
+>(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Overlay
+    className={cn(
+      "fixed inset-0 z-50 bg-background/80 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      className
+    )}
+    {...props}
+    ref={ref}
+  />
+))
+AlertDialogOverlay.displayName = AlertDialogPrimitive.Overlay.displayName
 
-  return (
-    <div className="flex min-h-[600px] items-center justify-center">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-green-100">
-            <Icons.check className="h-8 w-8 text-green-600" />
-          </div>
-          <CardTitle className="text-2xl">Welcome to Pro!</CardTitle>
-          <CardDescription>
-            Your subscription has been activated successfully
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="space-y-2 text-center">
-            <p className="text-sm text-gray-600">
-              You now have access to all Pro features:
-            </p>
-            <ul className="space-y-1 text-sm">
-              <li>✓ Unlimited users and projects</li>
-              <li>✓ Priority support</li>
-              <li>✓ Advanced analytics</li>
-              <li>✓ Custom integrations</li>
-            </ul>
-          </div>
+const AlertDialogContent = React.forwardRef<
+  React.ElementRef<typeof AlertDialogPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Content>
+>(({ className, ...props }, ref) => (
+  <AlertDialogPortal>
+    <AlertDialogOverlay />
+    <AlertDialogPrimitive.Content
+      ref={ref}
+      className={cn(
+        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg",
+        className
+      )}
+      {...props}
+    />
+  </AlertDialogPortal>
+))
+AlertDialogContent.displayName = AlertDialogPrimitive.Content.displayName
 
-          <div className="space-y-3">
-            <Button 
-              className="w-full" 
-              onClick={() => router.push('/dashboard')}
-            >
-              Go to Dashboard
-            </Button>
-            <p className="text-center text-xs text-gray-500">
-              Redirecting in {countdown} seconds...
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
-  )
+const AlertDialogHeader = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) => (
+  <div
+    className={cn(
+      "flex flex-col space-y-2 text-center sm:text-left",
+      className
+    )}
+    {...props}
+  />
+)
+AlertDialogHeader.displayName = "AlertDialogHeader"
+
+const AlertDialogFooter = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) => (
+  <div
+    className={cn(
+      "flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2",
+      className
+    )}
+    {...props}
+  />
+)
+AlertDialogFooter.displayName = "AlertDialogFooter"
+
+const AlertDialogTitle = React.forwardRef<
+  React.ElementRef<typeof AlertDialogPrimitive.Title>,
+  React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Title>
+>(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Title
+    ref={ref}
+    className={cn("text-lg font-semibold", className)}
+    {...props}
+  />
+))
+AlertDialogTitle.displayName = AlertDialogPrimitive.Title.displayName
+
+const AlertDialogDescription = React.forwardRef<
+  React.ElementRef<typeof AlertDialogPrimitive.Description>,
+  React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Description>
+>(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Description
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props}
+  />
+))
+AlertDialogDescription.displayName =
+  AlertDialogPrimitive.Description.displayName
+
+const AlertDialogAction = React.forwardRef<
+  React.ElementRef<typeof AlertDialogPrimitive.Action>,
+  React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Action>
+>(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Action
+    ref={ref}
+    className={cn(buttonVariants(), className)}
+    {...props}
+  />
+))
+AlertDialogAction.displayName = AlertDialogPrimitive.Action.displayName
+
+const AlertDialogCancel = React.forwardRef<
+  React.ElementRef<typeof AlertDialogPrimitive.Cancel>,
+  React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Cancel>
+>(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Cancel
+    ref={ref}
+    className={cn(
+      buttonVariants({ variant: "outline" }),
+      "mt-2 sm:mt-0",
+      className
+    )}
+    {...props}
+  />
+))
+AlertDialogCancel.displayName = AlertDialogPrimitive.Cancel.displayName
+
+export {
+  AlertDialog,
+  AlertDialogPortal,
+  AlertDialogOverlay,
+  AlertDialogTrigger,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogFooter,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogAction,
+  AlertDialogCancel,
 }
-
-
-
-// src/lib/email/service.ts
-import { resend } from './client'
-import { createClient } from '@/lib/supabase/server'
-import WelcomeEmail from '@/emails/welcome'
-import ResetPasswordEmail from '@/emails/reset-password'
-import TeamInvitationEmail from '@/emails/team-invitation'
-import InvoiceEmail from '@/emails/invoice'
-import { z } from 'zod'
-
-// Email types
-export const EmailType = {
-  WELCOME: 'welcome',
-  RESET_PASSWORD: 'reset_password',
-  TEAM_INVITATION: 'team_invitation',
-  INVOICE: 'invoice',
-  SUBSCRIPTION_CREATED: 'subscription_created',
-  SUBSCRIPTION_UPDATED: 'subscription_updated',
-  SUBSCRIPTION_CANCELLED: 'subscription_cancelled',
-  PAYMENT_FAILED: 'payment_failed',
-} as const
-
-export type EmailType = typeof EmailType[keyof typeof EmailType]
-
-// Email queue schema
-const emailQueueSchema = z.object({
-  id: z.string().optional(),
-  to: z.union([z.string().email(), z.array(z.string().email())]),
-  type: z.nativeEnum(EmailType),
-  data: z.record(z.any()),
-  status: z.enum(['pending', 'sent', 'failed']).default('pending'),
-  attempts: z.number().default(0),
-  error: z.string().optional(),
-  sent_at: z.string().optional(),
-  created_at: z.string().optional(),
-})
-
-export type EmailQueueItem = z.infer<typeof emailQueueSchema>
-
-export class EmailService {
-  // Queue an email for sending
-  static async queue(email: Omit<EmailQueueItem, 'id' | 'created_at'>) {
-    const supabase = createClient()
-    
-    const { data, error } = await supabase
-      .from('email_queue')
-      .insert({
-        ...email,
-        to: Array.isArray(email.to) ? email.to : [email.to],
-      })
-      .select()
-      .single()
-
-    if (error) {
-      throw new Error(`Failed to queue email: ${error.message}`)
-    }
-
-    // Try to send immediately
-    await this.processQueueItem(data)
-
-    return data
-  }
-
-  // Process a single queue item
-  static async processQueueItem(item: EmailQueueItem) {
-    const supabase = createClient()
-
-    try {
-      // Get email template based on type
-      const { subject, react, text } = await this.getEmailTemplate(item.type, item.data)
-
-      // Send email
-      const result = await resend.emails.send({
-        from: process.env.FROM_EMAIL!,
-        to: item.to,
-        subject,
-        react,
-        text,
-      })
-
-      if (result.error) {
-        throw new Error(result.error.message)
-      }
-
-      // Update queue item as sent
-      await supabase
-        .from('email_queue')
-        .update({
-          status: 'sent',
-          sent_at: new Date().toISOString(),
-        })
-        .eq('id', item.id)
-
-      return { success: true }
-    } catch (error: any) {
-      // Update queue item with error
-      await supabase
-        .from('email_queue')
-        .update({
-          status: 'failed',
-          attempts: item.attempts + 1,
-          error: error.message,
-        })
-        .eq('id', item.id)
-
-      throw error
-    }
-  }
-
-  // Process all pending emails in queue
-  static async processQueue() {
-    const supabase = createClient()
-    
-    // Get pending emails (max 3 attempts)
-    const { data: items } = await supabase
-      .from('email_queue')
-      .select('*')
-      .eq('status', 'pending')
-      .lt('attempts', 3)
-      .order('created_at', { ascending: true })
-      .limit(10)
-
-    if (!items) return
-
-    // Process each item
-    const results = await Promise.allSettled(
-      items.map(item => this.processQueueItem(item))
-    )
-
-    return results
-  }
-
-  // Get email template based on type
-  static async getEmailTemplate(type: EmailType, data: any) {
-    switch (type) {
-      case EmailType.WELCOME:
-        return {
-          subject: 'Welcome to Our Platform!',
-          react: WelcomeEmail({
-            userFirstName: data.name || 'there',
-            loginLink: `${process.env.NEXT_PUBLIC_APP_URL}/login`,
-          }),
-          text: `Welcome ${data.name || ''}! We're excited to have you on board.`,
-        }
-
-      case EmailType.RESET_PASSWORD:
-        return {
-          subject: 'Reset Your Password',
-          react: ResetPasswordEmail({
-            resetLink: data.resetLink,
-            userName: data.name,
-          }),
-          text: `Click here to reset your password: ${data.resetLink}`,
-        }
-
-      case EmailType.TEAM_INVITATION:
-        return {
-          subject: `You're invited to join ${data.teamName}`,
-          react: TeamInvitationEmail({
-            inviteLink: data.inviteLink,
-            inviterName: data.inviterName,
-            teamName: data.teamName,
-            recipientEmail: data.recipientEmail,
-          }),
-          text: `${data.inviterName} has invited you to join ${data.teamName}. Click here to accept: ${data.inviteLink}`,
-        }
-
-      case EmailType.INVOICE:
-        return {
-          subject: `Invoice #${data.invoiceNumber}`,
-          react: InvoiceEmail({
-            invoiceNumber: data.invoiceNumber,
-            customerName: data.customerName,
-            amount: data.amount,
-            dueDate: data.dueDate,
-            items: data.items,
-            downloadLink: data.downloadLink,
-          }),
-          text: `Your invoice #${data.invoiceNumber} for ${data.amount} is ready.`,
-        }
-
-      case EmailType.SUBSCRIPTION_CREATED:
-        return {
-          subject: 'Subscription Activated',
-          react: (
-            <div>
-              <h1>Welcome to Pro!</h1>
-              <p>Your subscription has been activated successfully.</p>
-              <p>You now have access to all Pro features.</p>
-            </div>
-          ),
-          text: 'Your Pro subscription has been activated.',
-        }
-
-      case EmailType.SUBSCRIPTION_UPDATED:
-        return {
-          subject: 'Subscription Updated',
-          react: (
-            <div>
-              <h1>Subscription Updated</h1>
-              <p>Your subscription has been updated successfully.</p>
-            </div>
-          ),
-          text: 'Your subscription has been updated.',
-        }
-
-      case EmailType.SUBSCRIPTION_CANCELLED:
-        return {
-          subject: 'Subscription Cancelled',
-          react: (
-            <div>
-              <h1>Subscription Cancelled</h1>
-              <p>Your subscription has been cancelled and will end on {data.endDate}.</p>
-              <p>You'll continue to have access until then.</p>
-            </div>
-          ),
-          text: `Your subscription has been cancelled and will end on ${data.endDate}.`,
-        }
-
-      case EmailType.PAYMENT_FAILED:
-        return {
-          subject: 'Payment Failed',
-          react: (
-            <div>
-              <h1>Payment Failed</h1>
-              <p>We couldn't process your payment. Please update your payment method.</p>
-              <a href={`${process.env.NEXT_PUBLIC_APP_URL}/billing`}>Update Payment Method</a>
-            </div>
-          ),
-          text: 'Your payment failed. Please update your payment method.',
-        }
-
-      default:
-        throw new Error(`Unknown email type: ${type}`)
-    }
-  }
-
-  // Send email immediately (bypasses queue)
-  static async send({
-    to,
-    subject,
-    react,
-    text,
-  }: {
-    to: string | string[]
-    subject: string
-    react?: React.ReactElement
-    text?: string
-  }) {
-    const result = await resend.emails.send({
-      from: process.env.FROM_EMAIL!,
-      to,
-      subject,
-      react,
-      text,
-    })
-
-    if (result.error) {
-      throw new Error(result.error.message)
-    }
-
-    return result
-  }
-
-  // Helper methods for common emails
-  static async sendWelcomeEmail(user: { email: string; name?: string }) {
-    return this.queue({
-      to: user.email,
-      type: EmailType.WELCOME,
-      data: { name: user.name },
-      status: 'pending',
-      attempts: 0,
-    })
-  }
-
-  static async sendPasswordResetEmail(email: string, resetLink: string, name?: string) {
-    return this.queue({
-      to: email,
-      type: EmailType.RESET_PASSWORD,
-      data: { resetLink, name },
-      status: 'pending',
-      attempts: 0,
-    })
-  }
-
-  static async sendTeamInvitationEmail({
-    to,
-    inviteLink,
-    inviterName,
-    teamName,
-  }: {
-    to: string
-    inviteLink: string
-    inviterName: string
-    teamName: string
-  }) {
-    return this.queue({
-      to,
-      type: EmailType.TEAM_INVITATION,
-      data: {
-        inviteLink,
-        inviterName,
-        teamName,
-        recipientEmail: to,
-      },
-      status: 'pending',
-      attempts: 0,
-    })
-  }
-
-  static async sendInvoiceEmail({
-    to,
-    invoice,
-  }: {
-    to: string
-    invoice: {
-      number: string
-      customerName: string
-      amount: string
-      dueDate: string
-      items: any[]
-      downloadLink: string
-    }
-  }) {
-    return this.queue({
-      to,
-      type: EmailType.INVOICE,
-      data: {
-        invoiceNumber: invoice.number,
-        customerName: invoice.customerName,
-        amount: invoice.amount,
-        dueDate: invoice.dueDate,
-        items: invoice.items,
-        downloadLink: invoice.downloadLink,
-      },
-      status: 'pending',
-      attempts: 0,
-    })
-  }
-}
-
-// src/lib/email/templates/subscription-emails.tsx
-import * as React from 'react'
-import {
-  Body,
-  Button,
-  Container,
-  Head,
-  Heading,
-  Html,
-  Link,
-  Preview,
-  Text,
-} from '@react-email/components'
-
-const baseStyles = {
-  main: {
-    backgroundColor: '#f6f9fc',
-    fontFamily:
-      '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Ubuntu,sans-serif',
-  },
-  container: {
-    backgroundColor: '#ffffff',
-    margin: '0 auto',
-    padding: '20px 0 48px',
-    marginBottom: '64px',
-  },
-  h1: {
-    color: '#333',
-    fontSize: '24px',
-    fontWeight: 'bold',
-    textAlign: 'center' as const,
-    margin: '30px 0',
-  },
-  text: {
-    color: '#333',
-    fontSize: '16px',
-    lineHeight: '26px',
-    textAlign: 'left' as const,
-  },
-  button: {
-    backgroundColor: '#5469d4',
-    borderRadius: '4px',
-    color: '#fff',
-    fontSize: '16px',
-    textDecoration: 'none',
-    textAlign: 'center' as const,
-    display: 'block',
-    width: '200px',
-    margin: '30px auto',
-    padding: '12px',
-  },
-}
-
-export function SubscriptionCreatedEmail({ userName }: { userName?: string }) {
-  return (
-    <Html>
-      <Head />
-      <Preview>Your subscription is now active</Preview>
-      <Body style={baseStyles.main}>
-        <Container style={baseStyles.container}>
-          <Heading style={baseStyles.h1}>Welcome to Pro!</Heading>
-          <Text style={baseStyles.text}>
-            Hi {userName || 'there'},
-          </Text>
-          <Text style={baseStyles.text}>
-            Your Pro subscription is now active! You have access to all premium features.
-          </Text>
-          <Button href={`${process.env.NEXT_PUBLIC_APP_URL}/dashboard`} style={baseStyles.button}>
-            Go to Dashboard
-          </Button>
-        </Container>
-      </Body>
-    </Html>
-  )
-}
-
-
--- supabase/migrations/20240102000000_create_email_queue.sql
-
--- Create email queue table
-CREATE TABLE IF NOT EXISTS email_queue (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  to TEXT[] NOT NULL,
-  type VARCHAR(50) NOT NULL,
-  data JSONB NOT NULL DEFAULT '{}',
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  error TEXT,
-  sent_at TIMESTAMP WITH TIME ZONE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Create indexes
-CREATE INDEX idx_email_queue_status ON email_queue(status);
-CREATE INDEX idx_email_queue_created_at ON email_queue(created_at);
-CREATE INDEX idx_email_queue_type ON email_queue(type);
-
--- Create updated_at trigger
-CREATE TRIGGER update_email_queue_updated_at
-  BEFORE UPDATE ON email_queue
-  FOR EACH ROW
-  EXECUTE FUNCTION update_updated_at_column();
-
--- Create function to clean old emails (optional)
-CREATE OR REPLACE FUNCTION clean_old_emails()
-RETURNS void AS $$
-BEGIN
-  DELETE FROM email_queue
-  WHERE status = 'sent' AND sent_at < NOW() - INTERVAL '30 days';
-  
-  DELETE FROM email_queue
-  WHERE status = 'failed' AND attempts >= 3 AND created_at < NOW() - INTERVAL '7 days';
-END;
-$$ LANGUAGE plpgsql;
-
--- Add RLS policies
-ALTER TABLE email_queue ENABLE ROW LEVEL SECURITY;
-
--- Only service role can access email queue
-CREATE POLICY "Service role can manage email queue" ON email_queue
-  FOR ALL USING (auth.role() = 'service_role');
-
--- Create email templates table (optional)
-CREATE TABLE IF NOT EXISTS email_templates (
-  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-  name VARCHAR(100) UNIQUE NOT NULL,
-  subject TEXT NOT NULL,
-  html_template TEXT,
-  text_template TEXT,
-  variables JSONB DEFAULT '[]',
-  is_active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Create trigger for email_templates
-CREATE TRIGGER update_email_templates_updated_at
-  BEFORE UPDATE ON email_templates
-  FOR EACH ROW
-  EXECUTE FUNCTION update_updated_at_column();
