@@ -5,6 +5,7 @@ import path from "path";
 import { promisify } from "util";
 import { fileURLToPath } from "url";
 import readline from "readline";
+import crypto from "crypto";
 
 // ES module compatibility
 const __filename = fileURLToPath(import.meta.url);
@@ -13,7 +14,355 @@ const __dirname = path.dirname(__filename);
 const writeFile = promisify(fs.writeFile);
 const mkdir = promisify(fs.mkdir);
 const readFile = promisify(fs.readFile);
+const stat = promisify(fs.stat);
 
+/**
+ * Logger class for consistent logging with levels and file output
+ */
+class Logger {
+  constructor(options = {}) {
+    this.logLevel = options.logLevel || 'info'; // debug, info, warn, error
+    this.logFile = options.logFile || null;
+    this.timestamp = options.timestamp !== false;
+    this.colorize = options.colorize !== false && process.stdout.isTTY;
+    this.sessionId = crypto.randomBytes(8).toString('hex');
+    
+    // Colors for different log levels
+    this.colors = {
+      debug: '\x1b[36m',   // Cyan
+      info: '\x1b[32m',    // Green
+      warn: '\x1b[33m',    // Yellow
+      error: '\x1b[31m',   // Red
+      reset: '\x1b[0m'
+    };
+    
+    this.levels = {
+      debug: 0,
+      info: 1,
+      warn: 2,
+      error: 3
+    };
+  }
+
+  shouldLog(level) {
+    return this.levels[level] >= this.levels[this.logLevel];
+  }
+
+  formatMessage(level, message, meta = {}) {
+    const timestamp = this.timestamp ? new Date().toISOString() : '';
+    const sessionInfo = `[${this.sessionId}]`;
+    
+    let formatted = '';
+    if (this.timestamp) formatted += `${timestamp} `;
+    formatted += `${sessionInfo} [${level.toUpperCase()}] ${message}`;
+    
+    if (Object.keys(meta).length > 0) {
+      formatted += ` ${JSON.stringify(meta)}`;
+    }
+    
+    return formatted;
+  }
+
+  async log(level, message, meta = {}) {
+    if (!this.shouldLog(level)) return;
+    
+    const formatted = this.formatMessage(level, message, meta);
+    
+    // Console output with colors
+    if (this.colorize) {
+      const color = this.colors[level] || '';
+      console.log(`${color}${formatted}${this.colors.reset}`);
+    } else {
+      console.log(formatted);
+    }
+    
+    // File output
+    if (this.logFile) {
+      try {
+        await writeFile(this.logFile, formatted + '\n', { flag: 'a' });
+      } catch (error) {
+        console.error('Failed to write to log file:', error.message);
+      }
+    }
+  }
+
+  debug(message, meta) { this.log('debug', message, meta); }
+  info(message, meta) { this.log('info', message, meta); }
+  warn(message, meta) { this.log('warn', message, meta); }
+  error(message, meta) { this.log('error', message, meta); }
+
+  // Create operation summary
+  createSummary(stats) {
+    return {
+      sessionId: this.sessionId,
+      timestamp: new Date().toISOString(),
+      ...stats
+    };
+  }
+}
+
+/**
+ * Progress tracker for long-running operations
+ */
+class ProgressTracker {
+  constructor(total, logger) {
+    this.total = total;
+    this.current = 0;
+    this.logger = logger;
+    this.startTime = Date.now();
+  }
+
+  update(increment = 1) {
+    this.current += increment;
+    const percentage = Math.round((this.current / this.total) * 100);
+    const elapsed = Date.now() - this.startTime;
+    const eta = this.current > 0 ? (elapsed / this.current) * (this.total - this.current) : 0;
+    
+    this.logger.info(`Progress: ${this.current}/${this.total} (${percentage}%) - ETA: ${Math.round(eta/1000)}s`);
+  }
+
+  complete() {
+    const totalTime = Date.now() - this.startTime;
+    this.logger.info(`Operation completed in ${totalTime}ms`);
+  }
+}
+
+/**
+ * Backup manager for creating file backups
+ */
+class BackupManager {
+  constructor(rootPath, logger) {
+    this.rootPath = rootPath;
+    this.logger = logger;
+  }
+
+  async createBackup(filePath) {
+    const fullPath = path.join(this.rootPath, filePath);
+    if (!fs.existsSync(fullPath)) return null;
+
+    const backupDir = path.join(this.rootPath, '.cosplit-backups');
+    await mkdir(backupDir, { recursive: true });
+    
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupName = `${path.basename(filePath)}.${timestamp}.backup`;
+    const backupPath = path.join(backupDir, backupName);
+    
+    try {
+      const content = await readFile(fullPath, 'utf8');
+      await writeFile(backupPath, content);
+      
+      this.logger.info(`Backup created: ${backupName}`, { originalFile: filePath });
+      return backupPath;
+    } catch (error) {
+      this.logger.error(`Failed to create backup for ${filePath}:`, { error: error.message });
+      return null;
+    }
+  }
+}
+
+/**
+ * Validation engine for file content validation
+ */
+class ValidationEngine {
+  constructor(logger) {
+    this.logger = logger;
+    this.rules = new Map();
+    this.setupDefaultRules();
+  }
+
+  setupDefaultRules() {
+    // File size validation
+    this.addRule('fileSize', (file) => {
+      const maxSize = 10 * 1024 * 1024; // 10MB
+      if (file.content.length > maxSize) {
+        return {
+          valid: false,
+          message: `File ${file.path} exceeds maximum size (${Math.round(file.content.length/1024/1024)}MB > 10MB)`
+        };
+      }
+      return { valid: true };
+    });
+
+    // Syntax validation for common file types
+    this.addRule('syntax', (file) => {
+      const ext = path.extname(file.path);
+      
+      if (['.json'].includes(ext)) {
+        try {
+          JSON.parse(file.content);
+        } catch (error) {
+          return {
+            valid: false,
+            message: `Invalid JSON syntax in ${file.path}: ${error.message}`
+          };
+        }
+      }
+      
+      // Basic bracket matching for code files
+      if (['.js', '.ts', '.tsx', '.jsx'].includes(ext)) {
+        const brackets = { '{': 0, '[': 0, '(': 0 };
+        for (const char of file.content) {
+          if (char === '{') brackets['{']++;
+          else if (char === '}') brackets['{']--;
+          else if (char === '[') brackets['[']++;
+          else if (char === ']') brackets['[']--;
+          else if (char === '(') brackets['(']++;
+          else if (char === ')') brackets['(']--;
+        }
+        
+        for (const [bracket, count] of Object.entries(brackets)) {
+          if (count !== 0) {
+            return {
+              valid: false,
+              message: `Unmatched ${bracket} brackets in ${file.path} (${count})`
+            };
+          }
+        }
+      }
+      
+      return { valid: true };
+    });
+
+    // Security validation
+    this.addRule('security', (file) => {
+      const dangerousPatterns = [
+        /eval\s*\(/,
+        /Function\s*\(/,
+        /document\.write/,
+        /innerHTML\s*=/,
+        /\.system\s*\(/,
+        /child_process/,
+        /fs\.unlink/,
+        /rm\s+-rf/
+      ];
+      
+      for (const pattern of dangerousPatterns) {
+        if (pattern.test(file.content)) {
+          return {
+            valid: false,
+            message: `Potentially dangerous code detected in ${file.path}: ${pattern}`
+          };
+        }
+      }
+      
+      return { valid: true };
+    });
+  }
+
+  addRule(name, validator) {
+    this.rules.set(name, validator);
+  }
+
+  async validateFile(file) {
+    const results = [];
+    
+    for (const [ruleName, validator] of this.rules) {
+      try {
+        const result = await validator(file);
+        if (!result.valid) {
+          results.push({
+            rule: ruleName,
+            message: result.message,
+            level: result.level || 'error'
+          });
+        }
+      } catch (error) {
+        this.logger.error(`Validation rule ${ruleName} failed:`, { error: error.message });
+      }
+    }
+    
+    return results;
+  }
+
+  async validateFiles(files) {
+    const allResults = [];
+    
+    for (const file of files) {
+      const results = await this.validateFile(file);
+      if (results.length > 0) {
+        allResults.push({ file: file.path, issues: results });
+      }
+    }
+    
+    return allResults;
+  }
+}
+
+/**
+ * Configuration manager for loading and saving config
+ */
+class ConfigManager {
+  constructor(rootPath, logger) {
+    this.rootPath = rootPath;
+    this.logger = logger;
+    this.configFile = path.join(rootPath, '.cosplit.config.json');
+    this.config = this.loadConfig();
+  }
+
+  loadConfig() {
+    const defaultConfig = {
+      patterns: {
+        typescript: /^\/\/\s*(.+\.(?:ts|tsx))\s*$/,
+        javascript: /^\/\/\s*(.+\.(?:js|jsx))\s*$/,
+        python: /^#\s*(.+\.py)\s*$/,
+        css: /^\/\*\s*(.+\.(?:css|scss|sass))\s*\*\/$/,
+        html: /^<!--\s*(.+\.html)\s*-->$/,
+        sql: /^--\s+(.+\.sql)\s*$/
+      },
+      validation: {
+        enabled: true,
+        rules: ['fileSize', 'syntax', 'security']
+      },
+      backup: {
+        enabled: false,
+        retention: 7 // days
+      },
+      templates: {},
+      excludePatterns: [
+        'node_modules/**',
+        '.git/**',
+        '*.log',
+        '*.tmp'
+      ]
+    };
+
+    if (fs.existsSync(this.configFile)) {
+      try {
+        const userConfig = JSON.parse(fs.readFileSync(this.configFile, 'utf8'));
+        this.logger.info('Loaded configuration file', { configFile: this.configFile });
+        return { ...defaultConfig, ...userConfig };
+      } catch (error) {
+        this.logger.warn('Failed to load config file, using defaults', { error: error.message });
+      }
+    }
+
+    return defaultConfig;
+  }
+
+  async saveConfig() {
+    try {
+      await writeFile(this.configFile, JSON.stringify(this.config, null, 2));
+      this.logger.info('Configuration saved', { configFile: this.configFile });
+    } catch (error) {
+      this.logger.error('Failed to save configuration', { error: error.message });
+    }
+  }
+
+  get(key) {
+    return key.split('.').reduce((obj, k) => obj?.[k], this.config);
+  }
+
+  set(key, value) {
+    const keys = key.split('.');
+    const lastKey = keys.pop();
+    const target = keys.reduce((obj, k) => obj[k] = obj[k] || {}, this.config);
+    target[lastKey] = value;
+  }
+}
+
+/**
+ * Main CodeSplitter class
+ */
 class CodeSplitter {
   constructor(options = {}) {
     this.rootPath = options.rootPath || process.cwd();
@@ -26,6 +375,28 @@ class CodeSplitter {
     this.skippedFiles = [];
     this.duplicateFiles = new Map(); // Track duplicate paths
     this.fileStats = new Map(); // Track file statistics
+    
+    // Enhanced features
+    this.logger = new Logger({
+      logLevel: options.logLevel || (this.verbose ? 'debug' : 'info'),
+      logFile: options.logFile,
+      colorize: options.colorize
+    });
+    
+    this.configManager = new ConfigManager(this.rootPath, this.logger);
+    this.backupManager = new BackupManager(this.rootPath, this.logger);
+    this.validator = new ValidationEngine(this.logger);
+    this.progressTracker = null;
+    
+    // Performance tracking
+    this.stats = {
+      startTime: Date.now(),
+      filesProcessed: 0,
+      bytesProcessed: 0,
+      duplicatesFound: 0,
+      validationErrors: 0,
+      backupsCreated: 0
+    };
   }
 
   /**
@@ -38,6 +409,8 @@ class CodeSplitter {
       input: process.stdin,
       output: process.stdout,
     });
+
+    this.logger.debug('Interactive mode initialized');
   }
 
   /**
@@ -46,6 +419,7 @@ class CodeSplitter {
   closeInteractive() {
     if (this.rl) {
       this.rl.close();
+      this.logger.debug('Interactive mode closed');
     }
   }
 
@@ -63,7 +437,9 @@ class CodeSplitter {
         : `${question}: `;
 
       this.rl.question(prompt, (answer) => {
-        resolve(answer.trim() || defaultValue);
+        const result = answer.trim() || defaultValue;
+        this.logger.debug('User input received', { question, answer: result });
+        resolve(result);
       });
     });
   }
@@ -78,7 +454,9 @@ class CodeSplitter {
     const answer = await this.ask(`${question} (${defaultText})`);
 
     if (!answer) return defaultValue;
-    return answer.toLowerCase().startsWith("y");
+    const result = answer.toLowerCase().startsWith("y");
+    this.logger.debug('User confirmation', { question, answer: result });
+    return result;
   }
 
   /**
@@ -219,7 +597,9 @@ class CodeSplitter {
    * Get available templates for file extension
    */
   getTemplatesForExtension(ext) {
-    const templates = {
+    const configTemplates = this.configManager.get('templates') || {};
+    
+    const defaultTemplates = {
       ".ts": {
         "Basic TypeScript": "// TypeScript file\nexport {};",
         Interface:
@@ -242,7 +622,7 @@ class CodeSplitter {
       },
     };
 
-    return templates[ext] || {};
+    return { ...defaultTemplates[ext], ...configTemplates[ext] } || {};
   }
 
   /**
@@ -261,6 +641,18 @@ class CodeSplitter {
       );
     });
 
+    // Show validation results if any
+    const validationResults = await this.validator.validateFiles(files);
+    if (validationResults.length > 0) {
+      console.log("\n⚠️  Validation Issues:");
+      validationResults.forEach(result => {
+        console.log(`   ${result.file}:`);
+        result.issues.forEach(issue => {
+          console.log(`     - [${issue.level}] ${issue.message}`);
+        });
+      });
+    }
+
     return await this.confirm("\nProceed with file creation?", true);
   }
 
@@ -268,7 +660,12 @@ class CodeSplitter {
    * Show final results
    */
   showResults() {
+    const duration = Date.now() - this.stats.startTime;
+    
     console.log("\n🎉 Operation completed!");
+    console.log(`⏱️  Duration: ${duration}ms`);
+    console.log(`📊 Files processed: ${this.stats.filesProcessed}`);
+    console.log(`💾 Bytes processed: ${this.stats.bytesProcessed}`);
 
     if (this.createdFiles.length > 0) {
       console.log(`\n✅ Created files (${this.createdFiles.length}):`);
@@ -290,11 +687,23 @@ class CodeSplitter {
       }
     }
 
+    if (this.stats.validationErrors > 0) {
+      console.log(`\n⚠️  Validation errors: ${this.stats.validationErrors}`);
+    }
+
+    if (this.stats.backupsCreated > 0) {
+      console.log(`\n💾 Backups created: ${this.stats.backupsCreated}`);
+    }
+
+    // Log final summary
+    this.logger.info('Operation completed', this.stats);
+
     if (this.interactive) {
       console.log("\n💡 Tips:");
       console.log("   • Use --verbose for more details");
       console.log("   • Use --dry-run to preview without creating files");
       console.log("   • Use --overwrite to replace existing files");
+      console.log("   • Configure .cosplit.config.json for custom settings");
     }
   }
 
@@ -304,6 +713,8 @@ class CodeSplitter {
   checkDuplicates(files) {
     const pathMap = new Map();
     const duplicates = new Map();
+
+    this.logger.debug('Checking for duplicate file paths', { totalFiles: files.length });
 
     // Group files by normalized path
     files.forEach((file, index) => {
@@ -323,11 +734,13 @@ class CodeSplitter {
       if (instances.length > 1) {
         const originalPath = instances[0].path; // Use first instance's original path
         duplicates.set(originalPath, instances);
+        this.stats.duplicatesFound++;
       }
     }
 
     // Log detailed duplicate information
     if (duplicates.size > 0) {
+      this.logger.warn('Duplicate file paths detected', { count: duplicates.size });
       console.log("\n⚠️  DUPLICATE FILE PATHS DETECTED:");
       console.log("═".repeat(60));
 
@@ -364,6 +777,14 @@ class CodeSplitter {
               );
             }
           }
+        });
+
+        // Log to file
+        this.logger.debug('Duplicate file details', {
+          path,
+          instances: instances.length,
+          contentSizes: instances.map(i => i.content.length),
+          lines: instances.map(i => i.line)
         });
 
         // Suggest resolution strategies
@@ -446,6 +867,11 @@ class CodeSplitter {
         current.content.length > max.content.length ? current : max
       );
 
+      this.logger.info(`Auto-resolved duplicate "${path}"`, { 
+        strategy: 'largest-content', 
+        size: largestInstance.content.length 
+      });
+      
       console.log(
         `📝 Auto-resolved duplicate "${path}": using instance with most content (${largestInstance.content.length} chars)`
       );
@@ -477,6 +903,8 @@ class CodeSplitter {
       "Choose resolution strategy:",
       strategies
     );
+    
+    this.logger.debug('Duplicate resolution strategy selected', { path, strategy });
 
     switch (strategy) {
       case "Keep first instance":
@@ -529,13 +957,20 @@ class CodeSplitter {
     let currentFile = null;
     let currentContent = [];
     let inCodeBlock = false;
+    
+    this.logger.debug('Parsing content', { lines: lines.length });
+    this.stats.bytesProcessed += content.length;
+
+    // Get patterns from config
+    const configPatterns = this.configManager.get('patterns');
+    const patterns = configPatterns ? Object.values(configPatterns) : null;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const trimmedLine = line.trim();
 
       // Detect file path comments
-      const filePathMatch = this.extractFilePath(trimmedLine);
+      const filePathMatch = this.extractFilePath(trimmedLine, patterns);
 
       if (filePathMatch) {
         // Save previous file if exists
@@ -544,6 +979,7 @@ class CodeSplitter {
             ...currentFile,
             content: this.cleanContent(currentContent.join("\n")),
           });
+          this.stats.filesProcessed++;
         }
 
         // Start new file
@@ -573,19 +1009,22 @@ class CodeSplitter {
         ...currentFile,
         content: this.cleanContent(currentContent.join("\n")),
       });
+      this.stats.filesProcessed++;
     }
-
+    
+    this.logger.info('Content parsed', { filesFound: files.length });
     return files;
   }
 
   /**
    * Extract file path from comment line
    * @param {string} line - Line to check
+   * @param {Array} customPatterns - Optional custom patterns from config
    * @returns {string|null} File path or null
    */
-  extractFilePath(line) {
+  extractFilePath(line, customPatterns = null) {
     // Common patterns for file path comments
-    const patterns = [
+    const defaultPatterns = [
       /^\/\/\s*(.+\.(?:ts|js|tsx|jsx|vue|py|java|cpp|c|h|cs|php|rb|go|rs|swift|kt|scala))\s*$/i,
       /^#\s*(.+\.(?:ts|js|tsx|jsx|vue|py|java|cpp|c|h|cs|php|rb|go|rs|swift|kt|scala))\s*$/i,
       /^\/\*\s*(.+\.(?:ts|js|tsx|jsx|vue|py|java|cpp|c|h|cs|php|rb|go|rs|swift|kt|scala))\s*\*\/$/i,
@@ -597,6 +1036,9 @@ class CodeSplitter {
       // General SQL comment pattern for any file extension
       /^--\s+([a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+)\s*$/,
     ];
+    
+    // Combine default and custom patterns
+    const patterns = customPatterns ? [...defaultPatterns, ...customPatterns] : defaultPatterns;
 
     for (const pattern of patterns) {
       const match = line.match(pattern);
@@ -706,6 +1148,8 @@ class CodeSplitter {
     if (this.verbose) {
       console.log(`📁 Creating: ${file.path}`);
     }
+    
+    this.logger.debug('Creating file', { path: file.path, size: file.content.length });
 
     if (this.dryRun) {
       console.log(`[DRY RUN] Would create: ${fullPath}`);
@@ -729,6 +1173,7 @@ class CodeSplitter {
         if (!shouldOverwrite) {
           console.log(`⏭️  Skipped: ${file.path}`);
           this.skippedFiles.push(file.path);
+          this.logger.info('File skipped (exists)', { path: file.path });
           return;
         }
       } else {
@@ -736,11 +1181,20 @@ class CodeSplitter {
           `⚠️  File exists, skipping: ${file.path} (use --overwrite to replace)`
         );
         this.skippedFiles.push(file.path);
+        this.logger.warn('File skipped (exists)', { path: file.path });
         return;
       }
     }
 
     try {
+      // Create backup if enabled
+      if (this.configManager.get('backup.enabled') && fs.existsSync(fullPath)) {
+        const backupPath = await this.backupManager.createBackup(file.path);
+        if (backupPath) {
+          this.stats.backupsCreated++;
+        }
+      }
+      
       // Create directory if not exists
       await mkdir(dirPath, { recursive: true });
 
@@ -749,8 +1203,10 @@ class CodeSplitter {
 
       console.log(`✅ Created: ${file.path}`);
       this.createdFiles.push(file.path);
+      this.logger.info('File created successfully', { path: file.path, size: file.content.length });
     } catch (error) {
       console.error(`❌ Error creating ${file.path}:`, error.message);
+      this.logger.error(`Error creating file`, { path: file.path, error: error.message });
     }
   }
 
@@ -771,15 +1227,18 @@ class CodeSplitter {
         if (this.verbose) {
           console.log(`📖 Reading from file: ${input}`);
         }
+        this.logger.info('Reading from file', { file: input });
       } else {
         // Treat as content string
         content = input;
         if (this.verbose) {
           console.log(`📝 Processing content string (${content.length} chars)`);
         }
+        this.logger.info('Processing content string', { length: content.length });
       }
     } catch (error) {
       console.error("❌ Error reading input:", error.message);
+      this.logger.error('Error reading input', { error: error.message });
       this.closeInteractive();
       return;
     }
@@ -789,9 +1248,13 @@ class CodeSplitter {
 
       if (files.length === 0) {
         console.log("ℹ️  No files found to create");
+        this.logger.info('No files found to create');
         this.closeInteractive();
         return;
       }
+
+      // Initialize progress tracker
+      this.progressTracker = new ProgressTracker(files.length, this.logger);
 
       console.log(`🔍 Found ${files.length} files to create:`);
       files.forEach((file) => {
@@ -808,6 +1271,7 @@ class CodeSplitter {
 
       if (files.length === 0) {
         console.log("ℹ️  No files to create after duplicate resolution");
+        this.logger.info('No files to create after duplicate resolution');
         this.closeInteractive();
         return;
       }
@@ -826,11 +1290,13 @@ class CodeSplitter {
               customizedFiles.push(customized);
             }
           }
+          this.progressTracker.update();
         }
         files = customizedFiles;
 
         if (files.length === 0) {
           console.log("ℹ️  No files selected for creation");
+          this.logger.info('No files selected for creation after customization');
           this.closeInteractive();
           return;
         }
@@ -839,6 +1305,7 @@ class CodeSplitter {
         const shouldProceed = await this.showSummary(files);
         if (!shouldProceed) {
           console.log("🚫 Operation cancelled");
+          this.logger.info('Operation cancelled by user');
           this.closeInteractive();
           return;
         }
@@ -846,6 +1313,7 @@ class CodeSplitter {
 
       if (this.dryRun) {
         console.log("\n🧪 DRY RUN MODE - No files will be created\n");
+        this.logger.info('Dry run mode - no files will be created');
       } else {
         console.log(`\n📂 Target directory: ${this.rootPath}\n`);
       }
@@ -855,10 +1323,16 @@ class CodeSplitter {
         await this.createFile(file);
       }
 
+      // Complete progress tracking
+      if (this.progressTracker) {
+        this.progressTracker.complete();
+      }
+
       // Show results
       this.showResults();
     } catch (error) {
       console.error("❌ Error processing content:", error.message);
+      this.logger.error('Error processing content', { error: error.message, stack: error.stack });
     } finally {
       this.closeInteractive();
     }
@@ -871,7 +1345,7 @@ function showHelp() {
 Code Splitter Tool - Automatically create files from commented code
 
 Usage:
-  node code-splitter.js [options] <input>
+  node cosplit.js [options] <input>
 
 Options:
   --root <path>     Set root directory (default: current directory)
@@ -879,26 +1353,28 @@ Options:
   --verbose         Show detailed output
   --overwrite       Overwrite existing files
   --interactive     Interactive mode with customization options
+  --log-file <path> Specify log file path
+  --log-level <lvl> Set log level (debug, info, warn, error)
   --help            Show this help
 
 Examples:
   # Basic usage
-  node code-splitter.js code.txt
+  node cosplit.js code.txt
   
   # Interactive mode (recommended)
-  node code-splitter.js --interactive --root ./src code.txt
+  node cosplit.js --interactive --root ./src code.txt
   
   # Set custom root directory
-  node code-splitter.js --root ./src code.txt
+  node cosplit.js --root ./src code.txt
   
   # Dry run to preview
-  node code-splitter.js --dry-run code.txt
+  node cosplit.js --dry-run code.txt
   
   # Process from stdin
-  cat code.txt | node code-splitter.js --interactive
+  cat code.txt | node cosplit.js --interactive
   
   # Direct content
-  node code-splitter.js --interactive "// types/state.ts
+  node cosplit.js --interactive "// types/state.ts
   export interface State { ... }"
 
 Interactive Mode Features:
@@ -918,6 +1394,11 @@ Duplicate File Handling:
     - Create separate files with suffixes
     - Skip duplicates
   • Content comparison to identify differences
+
+Configuration:
+  • Create .cosplit.config.json in your project root
+  • Customize file patterns, templates, and validation rules
+  • Enable automatic backups of overwritten files
 
 Supported file path formats:
   // path/to/file.ts
@@ -941,6 +1422,9 @@ async function main() {
     verbose: false,
     overwrite: false,
     interactive: false,
+    logFile: null,
+    logLevel: 'info',
+    colorize: true
   };
 
   let input = "";
@@ -965,6 +1449,15 @@ async function main() {
       case "--interactive":
       case "-i":
         options.interactive = true;
+        break;
+      case "--log-file":
+        options.logFile = args[++i];
+        break;
+      case "--log-level":
+        options.logLevel = args[++i];
+        break;
+      case "--no-color":
+        options.colorize = false;
         break;
       default:
         if (!arg.startsWith("--")) {
