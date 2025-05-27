@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String    @id @default(uuid())
+  email             String    @unique
+  emailVerified     DateTime?
+  name              String?
+  avatarUrl         String?
+  role              UserRole  @default(USER)
+  stripeCustomerId  String?   @unique
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  
+  profile           Profile?
+  subscriptions     Subscription[]
+  organizations     OrganizationMember[]
+  sessions          Session[]
+  apiKeys           ApiKey[]
+  
+  @@map("users")
+}
+
+model Profile {
+  id              String    @id @default(uuid())
+  userId          String    @unique
+  bio             String?
+  website         String?
+  location        String?
+  timezone        String    @default("UTC")
+  language        String    @default("en")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("profiles")
+}
+
+model Organization {
+  id              String    @id @default(uuid())
+  name            String
+  slug            String    @unique
+  description     String?
+  logoUrl         String?
+  website         String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  members         OrganizationMember[]
+  subscription    Subscription?
+  
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id              String    @id @default(uuid())
+  userId          String
+  organizationId  String
+  role            OrgRole   @default(MEMBER)
+  joinedAt        DateTime  @default(now())
+  
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, organizationId])
+  @@map("organization_members")
+}
+
+model Subscription {
+  id                    String    @id @default(uuid())
+  userId                String?
+  organizationId        String?   @unique
+  stripeSubscriptionId  String    @unique
+  stripePriceId         String
+  stripeCurrentPeriodEnd DateTime
+  status                SubscriptionStatus
+  metadata              Json?
+  cancelAtPeriodEnd     Boolean   @default(false)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  
+  user                  User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization          Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  
+  @@map("subscriptions")
+}
+
+model Session {
+  id              String    @id @default(uuid())
+  userId          String
+  token           String    @unique
+  expiresAt       DateTime
+  userAgent       String?
+  ipAddress       String?
+  createdAt       DateTime  @default(now())
+  
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("sessions")
+}
+
+model ApiKey {
+  id              String    @id @default(uuid())
+  userId          String
+  name            String
+  key             String    @unique
+  lastUsedAt      DateTime?
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("api_keys")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  PAST_DUE
+  TRIALING
+  UNPAID
+}
