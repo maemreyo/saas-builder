@@ -1,1778 +1,474 @@
-// src/lib/auth/service.ts
+// src/lib/billing/service.ts
+import { stripe } from '@/lib/payments/stripe'
 import { createClient } from '@/lib/supabase/server'
-import { createBrowserClient } from '@supabase/ssr'
-import { cookies } from 'next/headers'
-import { redirect } from 'next/navigation'
-import { z } from 'zod'
+import Stripe from 'stripe'
 
-// Validation schemas
-export const signUpSchema = z.object({
-  email: z.string().email('Invalid email address'),
-  password: z.string().min(8, 'Password must be at least 8 characters'),
-  name: z.string().optional(),
-})
-
-export const signInSchema = z.object({
-  email: z.string().email('Invalid email address'),
-  password: z.string().min(1, 'Password is required'),
-})
-
-export const resetPasswordSchema = z.object({
-  email: z.string().email('Invalid email address'),
-})
-
-export const updatePasswordSchema = z.object({
-  password: z.string().min(8, 'Password must be at least 8 characters'),
-  confirmPassword: z.string(),
-}).refine((data) => data.password === data.confirmPassword, {
-  message: "Passwords don't match",
-  path: ["confirmPassword"],
-})
-
-// Auth service class
-export class AuthService {
-  // Sign up with email/password
-  static async signUp(data: z.infer<typeof signUpSchema>) {
+export class BillingService {
+  // Create or get Stripe customer
+  static async createOrGetCustomer(userId: string, email: string) {
     const supabase = createClient()
     
-    const { error, data: authData } = await supabase.auth.signUp({
-      email: data.email,
-      password: data.password,
-      options: {
-        data: {
-          name: data.name,
+    // Check if user already has a Stripe customer ID
+    const { data: user } = await supabase
+      .from('users')
+      .select('stripe_customer_id')
+      .eq('id', userId)
+      .single()
+
+    if (user?.stripe_customer_id) {
+      return user.stripe_customer_id
+    }
+
+    // Create new Stripe customer
+    const customer = await stripe.customers.create({
+      email,
+      metadata: {
+        userId,
+      },
+    })
+
+    // Update user with Stripe customer ID
+    await supabase
+      .from('users')
+      .update({ stripe_customer_id: customer.id })
+      .eq('id', userId)
+
+    return customer.id
+  }
+
+  // Create checkout session
+  static async createCheckoutSession({
+    userId,
+    email,
+    priceId,
+    successUrl,
+    cancelUrl,
+    metadata = {},
+  }: {
+    userId: string
+    email: string
+    priceId: string
+    successUrl: string
+    cancelUrl: string
+    metadata?: Record<string, string>
+  }) {
+    const customerId = await this.createOrGetCustomer(userId, email)
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
         },
-        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
+      ],
+      mode: 'subscription',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        userId,
+        ...metadata,
+      },
+      subscription_data: {
+        metadata: {
+          userId,
+          ...metadata,
+        },
+      },
+      allow_promotion_codes: true,
+      billing_address_collection: 'required',
+      customer_update: {
+        address: 'auto',
       },
     })
 
-    if (error) {
-      return { error: error.message }
-    }
-
-    // Create user profile
-    if (authData.user) {
-      await supabase.from('profiles').insert({
-        user_id: authData.user.id,
-        // Additional profile fields can be added here
-      })
-    }
-
-    return { data: authData }
+    return session
   }
 
-  // Sign in with email/password
-  static async signIn(data: z.infer<typeof signInSchema>) {
-    const supabase = createClient()
-    
-    const { error, data: authData } = await supabase.auth.signInWithPassword({
-      email: data.email,
-      password: data.password,
+  // Create billing portal session
+  static async createPortalSession({
+    customerId,
+    returnUrl,
+  }: {
+    customerId: string
+    returnUrl: string
+  }) {
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: returnUrl,
     })
 
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data: authData }
+    return session
   }
 
-  // Sign in with OAuth provider
-  static async signInWithProvider(provider: 'google' | 'github') {
+  // Get user's subscription
+  static async getSubscription(userId: string) {
     const supabase = createClient()
     
-    const { error, data } = await supabase.auth.signInWithOAuth({
-      provider,
-      options: {
-        redirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
-      },
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data }
-  }
-
-  // Sign in with magic link
-  static async signInWithMagicLink(email: string) {
-    const supabase = createClient()
-    
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
-      },
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { success: true }
-  }
-
-  // Send password reset email
-  static async resetPassword(email: string) {
-    const supabase = createClient()
-    
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/reset-password`,
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { success: true }
-  }
-
-  // Update password
-  static async updatePassword(password: string) {
-    const supabase = createClient()
-    
-    const { error } = await supabase.auth.updateUser({
-      password,
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { success: true }
-  }
-
-  // Sign out
-  static async signOut() {
-    const supabase = createClient()
-    const { error } = await supabase.auth.signOut()
-    
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { success: true }
-  }
-
-  // Get current user
-  static async getUser() {
-    const supabase = createClient()
-    const { data: { user }, error } = await supabase.auth.getUser()
-    
-    if (error || !user) {
-      return { user: null }
-    }
-
-    // Get user profile
-    const { data: profile } = await supabase
-      .from('profiles')
+    const { data } = await supabase
+      .from('subscriptions')
       .select('*')
-      .eq('user_id', user.id)
+      .or(`user_id.eq.${userId}`)
+      .eq('status', 'active')
       .single()
 
-    return { user, profile }
+    return data
   }
 
-  // Get session
-  static async getSession() {
-    const supabase = createClient()
-    const { data: { session }, error } = await supabase.auth.getSession()
-    
-    return { session, error }
-  }
-
-  // Refresh session
-  static async refreshSession() {
-    const supabase = createClient()
-    const { data: { session }, error } = await supabase.auth.refreshSession()
-    
-    return { session, error }
-  }
-
-  // Verify email with OTP
-  static async verifyOtp(email: string, token: string, type: 'signup' | 'magiclink' = 'signup') {
+  // Get user's subscriptions (including inactive)
+  static async getSubscriptions(userId: string) {
     const supabase = createClient()
     
-    const { error, data } = await supabase.auth.verifyOtp({
-      email,
-      token,
-      type,
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data }
-  }
-
-  // Enable 2FA
-  static async enable2FA() {
-    const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-    
-    if (!user) {
-      return { error: 'Not authenticated' }
-    }
-
-    const { data, error } = await supabase.auth.mfa.enroll({
-      factorType: 'totp',
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data }
-  }
-
-  // Verify 2FA
-  static async verify2FA(code: string, factorId: string) {
-    const supabase = createClient()
-    
-    const { data, error } = await supabase.auth.mfa.verify({
-      factorId,
-      code,
-    })
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data }
-  }
-
-  // Check if user needs 2FA
-  static async check2FARequired() {
-    const supabase = createClient()
-    const { data: { session } } = await supabase.auth.getSession()
-    
-    if (!session) {
-      return { required: false }
-    }
-
-    const { data: factors } = await supabase.auth.mfa.listFactors()
-    
-    return {
-      required: factors && factors.length > 0,
-      factors,
-    }
-  }
-
-  // Session management
-  static async createSession(userId: string, metadata?: any) {
-    const supabase = createClient()
-    
-    const { data, error } = await supabase
-      .from('sessions')
-      .insert({
-        user_id: userId,
-        token: crypto.randomUUID(),
-        expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
-        user_agent: metadata?.userAgent,
-        ip_address: metadata?.ipAddress,
-      })
-      .select()
-      .single()
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data }
-  }
-
-  // List user sessions
-  static async listSessions(userId: string) {
-    const supabase = createClient()
-    
-    const { data, error } = await supabase
-      .from('sessions')
+    const { data } = await supabase
+      .from('subscriptions')
       .select('*')
-      .eq('user_id', userId)
+      .or(`user_id.eq.${userId}`)
       .order('created_at', { ascending: false })
 
-    if (error) {
-      return { error: error.message }
-    }
-
-    return { data }
+    return data || []
   }
 
-  // Revoke session
-  static async revokeSession(sessionId: string) {
+  // Cancel subscription
+  static async cancelSubscription(subscriptionId: string) {
+    const subscription = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true,
+    })
+
+    return subscription
+  }
+
+  // Resume subscription
+  static async resumeSubscription(subscriptionId: string) {
+    const subscription = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: false,
+    })
+
+    return subscription
+  }
+
+  // Update subscription
+  static async updateSubscription(subscriptionId: string, newPriceId: string) {
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId)
+    
+    const updatedSubscription = await stripe.subscriptions.update(subscriptionId, {
+      items: [
+        {
+          id: subscription.items.data[0].id,
+          price: newPriceId,
+        },
+      ],
+      proration_behavior: 'create_prorations',
+    })
+
+    return updatedSubscription
+  }
+
+  // Get invoices
+  static async getInvoices(customerId: string, limit = 10) {
+    const invoices = await stripe.invoices.list({
+      customer: customerId,
+      limit,
+    })
+
+    return invoices.data
+  }
+
+  // Get upcoming invoice
+  static async getUpcomingInvoice(customerId: string) {
+    try {
+      const invoice = await stripe.invoices.retrieveUpcoming({
+        customer: customerId,
+      })
+      return invoice
+    } catch (error) {
+      // No upcoming invoice
+      return null
+    }
+  }
+
+  // Add payment method
+  static async addPaymentMethod(customerId: string, paymentMethodId: string) {
+    await stripe.paymentMethods.attach(paymentMethodId, {
+      customer: customerId,
+    })
+
+    // Set as default payment method
+    await stripe.customers.update(customerId, {
+      invoice_settings: {
+        default_payment_method: paymentMethodId,
+      },
+    })
+  }
+
+  // Get payment methods
+  static async getPaymentMethods(customerId: string) {
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerId,
+      type: 'card',
+    })
+
+    return paymentMethods.data
+  }
+
+  // Remove payment method
+  static async removePaymentMethod(paymentMethodId: string) {
+    await stripe.paymentMethods.detach(paymentMethodId)
+  }
+
+  // Create setup intent for adding payment methods
+  static async createSetupIntent(customerId: string) {
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+    })
+
+    return setupIntent
+  }
+
+  // Handle webhook events
+  static async handleWebhookEvent(event: Stripe.Event) {
     const supabase = createClient()
-    
-    const { error } = await supabase
-      .from('sessions')
-      .delete()
-      .eq('id', sessionId)
 
-    if (error) {
-      return { error: error.message }
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object as Stripe.Checkout.Session
+        
+        if (session.mode === 'subscription') {
+          const subscription = await stripe.subscriptions.retrieve(
+            session.subscription as string
+          )
+
+          await supabase.from('subscriptions').insert({
+            user_id: session.metadata?.userId,
+            organization_id: session.metadata?.organizationId,
+            stripe_subscription_id: subscription.id,
+            stripe_price_id: subscription.items.data[0].price.id,
+            stripe_current_period_end: new Date(
+              subscription.current_period_end * 1000
+            ).toISOString(),
+            status: subscription.status.toUpperCase() as any,
+            metadata: subscription.metadata,
+          })
+        }
+        break
+      }
+
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object as Stripe.Subscription
+        
+        await supabase
+          .from('subscriptions')
+          .update({
+            stripe_price_id: subscription.items.data[0].price.id,
+            status: subscription.status.toUpperCase() as any,
+            stripe_current_period_end: new Date(
+              subscription.current_period_end * 1000
+            ).toISOString(),
+            cancel_at_period_end: subscription.cancel_at_period_end,
+            metadata: subscription.metadata,
+          })
+          .eq('stripe_subscription_id', subscription.id)
+        break
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object as Stripe.Subscription
+        
+        await supabase
+          .from('subscriptions')
+          .update({ 
+            status: 'CANCELED',
+            canceled_at: new Date().toISOString(),
+          })
+          .eq('stripe_subscription_id', subscription.id)
+        break
+      }
+
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object as Stripe.Invoice
+        
+        // You can log successful payments or send receipts here
+        console.log(`Payment succeeded for invoice ${invoice.id}`)
+        break
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object as Stripe.Invoice
+        
+        // Handle failed payments - send emails, update UI, etc.
+        console.log(`Payment failed for invoice ${invoice.id}`)
+        
+        // Update subscription status
+        if (invoice.subscription) {
+          await supabase
+            .from('subscriptions')
+            .update({ status: 'PAST_DUE' })
+            .eq('stripe_subscription_id', invoice.subscription)
+        }
+        break
+      }
     }
-
-    return { success: true }
   }
 
-  // Check user permissions
-  static async checkPermission(permission: string): Promise<boolean> {
-    const { user } = await this.getUser()
-    
-    if (!user) {
-      return false
-    }
+  // Get subscription price details
+  static async getPriceDetails(priceId: string) {
+    const price = await stripe.prices.retrieve(priceId, {
+      expand: ['product'],
+    })
 
-    // Add your permission logic here
-    // For now, just check if user exists
-    return true
+    return {
+      id: price.id,
+      amount: price.unit_amount || 0,
+      currency: price.currency,
+      interval: price.recurring?.interval,
+      intervalCount: price.recurring?.interval_count,
+      product: price.product as Stripe.Product,
+    }
   }
 
-  // Protected route helper
-  static async requireAuth(redirectTo: string = '/login') {
-    const { user } = await this.getUser()
-    
-    if (!user) {
-      redirect(redirectTo)
-    }
-
-    return user
+  // Check if user has active subscription
+  static async hasActiveSubscription(userId: string): Promise<boolean> {
+    const subscription = await this.getSubscription(userId)
+    return !!subscription && subscription.status === 'ACTIVE'
   }
 
-  // Admin route helper
-  static async requireAdmin(redirectTo: string = '/dashboard') {
-    const { user, profile } = await this.getUser()
+  // Get subscription limits
+  static async getSubscriptionLimits(userId: string) {
+    const subscription = await this.getSubscription(userId)
     
-    if (!user || !profile) {
-      redirect('/login')
+    if (!subscription) {
+      // Return free tier limits
+      return {
+        tier: 'free',
+        limits: {
+          users: 1,
+          projects: 10,
+          storage: 1024 * 1024 * 100, // 100MB
+          apiCalls: 1000,
+        },
+      }
     }
 
-    const { data: userData } = await createClient()
-      .from('users')
-      .select('role')
-      .eq('id', user.id)
-      .single()
-
-    if (!userData || (userData.role !== 'ADMIN' && userData.role !== 'SUPER_ADMIN')) {
-      redirect(redirectTo)
+    // Get price details to determine tier
+    const priceDetails = await this.getPriceDetails(subscription.stripe_price_id)
+    
+    // Map price IDs to tiers (you'll need to configure these)
+    const tierMap: Record<string, any> = {
+      [process.env.NEXT_PUBLIC_STRIPE_PRO_PRICE_ID!]: {
+        tier: 'pro',
+        limits: {
+          users: -1, // unlimited
+          projects: -1,
+          storage: 1024 * 1024 * 1024 * 10, // 10GB
+          apiCalls: -1,
+        },
+      },
+      // Add more tiers as needed
     }
 
-    return { user, profile, role: userData.role }
+    return tierMap[subscription.stripe_price_id] || {
+      tier: 'unknown',
+      limits: {},
+    }
   }
 }
 
 
-
-
-
-// src/hooks/use-auth.ts
+// src/hooks/use-billing.ts
 'use client'
 
 import { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { createClient } from '@/lib/supabase/client'
-import { User, Session } from '@supabase/supabase-js'
-
-interface AuthState {
-  user: User | null
-  session: Session | null
-  loading: boolean
-  error: string | null
-}
-
-export function useAuth() {
-  const [state, setState] = useState<AuthState>({
-    user: null,
-    session: null,
-    loading: true,
-    error: null,
-  })
-  const router = useRouter()
-  const supabase = createClient()
-
-  useEffect(() => {
-    // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setState({
-        user: session?.user ?? null,
-        session,
-        loading: false,
-        error: null,
-      })
-    })
-
-    // Listen for auth changes
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setState({
-        user: session?.user ?? null,
-        session,
-        loading: false,
-        error: null,
-      })
-    })
-
-    return () => subscription.unsubscribe()
-  }, [supabase.auth])
-
-  const signIn = useCallback(
-    async (email: string, password: string) => {
-      setState((prev) => ({ ...prev, loading: true, error: null }))
-      
-      const { error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      })
-
-      if (error) {
-        setState((prev) => ({ ...prev, loading: false, error: error.message }))
-        return { error: error.message }
-      }
-
-      router.push('/dashboard')
-      return { error: null }
-    },
-    [supabase.auth, router]
-  )
-
-  const signUp = useCallback(
-    async (email: string, password: string, metadata?: any) => {
-      setState((prev) => ({ ...prev, loading: true, error: null }))
-      
-      const { error, data } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          data: metadata,
-          emailRedirectTo: `${window.location.origin}/auth/callback`,
-        },
-      })
-
-      if (error) {
-        setState((prev) => ({ ...prev, loading: false, error: error.message }))
-        return { error: error.message }
-      }
-
-      return { error: null, data }
-    },
-    [supabase.auth]
-  )
-
-  const signInWithProvider = useCallback(
-    async (provider: 'google' | 'github') => {
-      setState((prev) => ({ ...prev, loading: true, error: null }))
-      
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider,
-        options: {
-          redirectTo: `${window.location.origin}/auth/callback`,
-        },
-      })
-
-      if (error) {
-        setState((prev) => ({ ...prev, loading: false, error: error.message }))
-        return { error: error.message }
-      }
-
-      return { error: null }
-    },
-    [supabase.auth]
-  )
-
-  const signOut = useCallback(async () => {
-    setState((prev) => ({ ...prev, loading: true, error: null }))
-    
-    const { error } = await supabase.auth.signOut()
-
-    if (error) {
-      setState((prev) => ({ ...prev, loading: false, error: error.message }))
-      return { error: error.message }
-    }
-
-    router.push('/login')
-    return { error: null }
-  }, [supabase.auth, router])
-
-  const resetPassword = useCallback(
-    async (email: string) => {
-      setState((prev) => ({ ...prev, loading: true, error: null }))
-      
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${window.location.origin}/auth/reset-password`,
-      })
-
-      if (error) {
-        setState((prev) => ({ ...prev, loading: false, error: error.message }))
-        return { error: error.message }
-      }
-
-      setState((prev) => ({ ...prev, loading: false }))
-      return { error: null }
-    },
-    [supabase.auth]
-  )
-
-  const updatePassword = useCallback(
-    async (password: string) => {
-      setState((prev) => ({ ...prev, loading: true, error: null }))
-      
-      const { error } = await supabase.auth.updateUser({ password })
-
-      if (error) {
-        setState((prev) => ({ ...prev, loading: false, error: error.message }))
-        return { error: error.message }
-      }
-
-      setState((prev) => ({ ...prev, loading: false }))
-      return { error: null }
-    },
-    [supabase.auth]
-  )
-
-  return {
-    user: state.user,
-    session: state.session,
-    loading: state.loading,
-    error: state.error,
-    signIn,
-    signUp,
-    signInWithProvider,
-    signOut,
-    resetPassword,
-    updatePassword,
-  }
-}
-
-// src/hooks/use-user.ts
-'use client'
-
-import { useEffect, useState } from 'react'
-import { createClient } from '@/lib/supabase/client'
 import { useAuth } from './use-auth'
+import { createClient } from '@/lib/supabase/client'
 
-interface UserProfile {
+interface Subscription {
   id: string
-  user_id: string
-  bio?: string
-  website?: string
-  location?: string
-  timezone: string
-  language: string
+  user_id?: string
+  organization_id?: string
+  stripe_subscription_id: string
+  stripe_price_id: string
+  stripe_current_period_end: string
+  status: string
+  cancel_at_period_end: boolean
+  metadata?: any
   created_at: string
   updated_at: string
 }
 
-interface UserData {
+interface PaymentMethod {
   id: string
-  email: string
-  name?: string
-  avatar_url?: string
-  role: 'USER' | 'ADMIN' | 'SUPER_ADMIN'
-  created_at: string
+  brand: string
+  last4: string
+  exp_month: number
+  exp_year: number
+  is_default: boolean
 }
 
-export function useUser() {
+interface Invoice {
+  id: string
+  amount_paid: number
+  amount_due: number
+  currency: string
+  status: string
+  created: number
+  invoice_pdf?: string
+  hosted_invoice_url?: string
+}
+
+export function useBilling() {
   const { user } = useAuth()
-  const [profile, setProfile] = useState<UserProfile | null>(null)
-  const [userData, setUserData] = useState<UserData | null>(null)
+  const [subscription, setSubscription] = useState<Subscription | null>(null)
+  const [paymentMethods, setPaymentMethods] = useState<PaymentMethod[]>([])
+  const [invoices, setInvoices] = useState<Invoice[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const router = useRouter()
   const supabase = createClient()
 
   useEffect(() => {
-    if (!user) {
-      setProfile(null)
-      setUserData(null)
-      setLoading(false)
-      return
-    }
-
-    const fetchUserData = async () => {
-      setLoading(true)
-
-      // Fetch user data
-      const { data: userRecord } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', user.id)
-        .single()
-
-      if (userRecord) {
-        setUserData(userRecord)
-      }
-
-      // Fetch profile
-      const { data: profileData } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('user_id', user.id)
-        .single()
-
-      if (profileData) {
-        setProfile(profileData)
-      }
-
+    if (user) {
+      fetchBillingData()
+    } else {
+      setSubscription(null)
+      setPaymentMethods([])
+      setInvoices([])
       setLoading(false)
     }
-
-    fetchUserData()
-
-    // Subscribe to profile changes
-    const profileSubscription = supabase
-      .channel(`profile:${user.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'profiles',
-          filter: `user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          if (payload.new) {
-            setProfile(payload.new as UserProfile)
-          }
-        }
-      )
-      .subscribe()
-
-    return () => {
-      profileSubscription.unsubscribe()
-    }
-  }, [user, supabase])
-
-  const updateProfile = async (updates: Partial<UserProfile>) => {
-    if (!user) return { error: 'Not authenticated' }
-
-    const { data, error } = await supabase
-      .from('profiles')
-      .update(updates)
-      .eq('user_id', user.id)
-      .select()
-      .single()
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    setProfile(data)
-    return { data }
-  }
-
-  const updateUser = async (updates: Partial<UserData>) => {
-    if (!user) return { error: 'Not authenticated' }
-
-    const { data, error } = await supabase
-      .from('users')
-      .update(updates)
-      .eq('id', user.id)
-      .select()
-      .single()
-
-    if (error) {
-      return { error: error.message }
-    }
-
-    setUserData(data)
-    return { data }
-  }
-
-  return {
-    user: userData,
-    profile,
-    loading,
-    updateProfile,
-    updateUser,
-    isAdmin: userData?.role === 'ADMIN' || userData?.role === 'SUPER_ADMIN',
-    isSuperAdmin: userData?.role === 'SUPER_ADMIN',
-  }
-}
-
-// src/hooks/use-session.ts
-'use client'
-
-import { useEffect, useState } from 'react'
-import { createClient } from '@/lib/supabase/client'
-import { useAuth } from './use-auth'
-
-interface SessionData {
-  id: string
-  user_id: string
-  token: string
-  expires_at: string
-  user_agent?: string
-  ip_address?: string
-  created_at: string
-}
-
-export function useSession() {
-  const { user } = useAuth()
-  const [sessions, setSessions] = useState<SessionData[]>([])
-  const [currentSession, setCurrentSession] = useState<SessionData | null>(null)
-  const [loading, setLoading] = useState(true)
-  const supabase = createClient()
-
-  useEffect(() => {
-    if (!user) {
-      setSessions([])
-      setCurrentSession(null)
-      setLoading(false)
-      return
-    }
-
-    fetchSessions()
   }, [user])
 
-  const fetchSessions = async () => {
-    if (!user) return
-
-    setLoading(true)
-    const { data, error } = await supabase
-      .from('sessions')
-      .select('*')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: false })
-
-    if (!error && data) {
-      setSessions(data)
-      // Assume the most recent session is current
-      setCurrentSession(data[0] || null)
-    }
-    setLoading(false)
-  }
-
-  const revokeSession = async (sessionId: string) => {
-    const { error } = await supabase
-      .from('sessions')
-      .delete()
-      .eq('id', sessionId)
-
-    if (!error) {
-      setSessions(sessions.filter(s => s.id !== sessionId))
-    }
-
-    return { error }
-  }
-
-  const revokeAllSessions = async (exceptCurrent = true) => {
-    if (!user) return { error: 'Not authenticated' }
-
-    const sessionsToRevoke = exceptCurrent && currentSession
-      ? sessions.filter(s => s.id !== currentSession.id)
-      : sessions
-
-    const { error } = await supabase
-      .from('sessions')
-      .delete()
-      .in('id', sessionsToRevoke.map(s => s.id))
-
-    if (!error) {
-      setSessions(exceptCurrent && currentSession ? [currentSession] : [])
-    }
-
-    return { error }
-  }
-
-  return {
-    sessions,
-    currentSession,
-    loading,
-    revokeSession,
-    revokeAllSessions,
-    refreshSessions: fetchSessions,
-  }
-}
-
-
-
-
-// src/app/(auth)/register/page.tsx
-'use client'
-
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
-import Link from 'next/link'
-import { useAuth } from '@/hooks/use-auth'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Icons } from '@/components/ui/icons'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-
-export default function RegisterPage() {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')
-  const [name, setName] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [showVerification, setShowVerification] = useState(false)
-  
-  const { signUp, signInWithProvider } = useAuth()
-  const router = useRouter()
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setError(null)
-
-    // Validate passwords match
-    if (password !== confirmPassword) {
-      setError('Passwords do not match')
-      return
-    }
-
-    // Validate password length
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters')
-      return
-    }
-
-    setLoading(true)
-    
-    const { error } = await signUp(email, password, { name })
-
-    if (error) {
-      setError(error)
-      setLoading(false)
-      return
-    }
-
-    // Show verification message
-    setShowVerification(true)
-    setLoading(false)
-  }
-
-  const handleOAuthSignIn = async (provider: 'google' | 'github') => {
-    setError(null)
-    const { error } = await signInWithProvider(provider)
-    if (error) {
-      setError(error)
-    }
-  }
-
-  if (showVerification) {
-    return (
-      <div className="flex min-h-screen items-center justify-center px-4">
-        <div className="w-full max-w-md space-y-8">
-          <div className="text-center">
-            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
-            <h2 className="mt-6 text-3xl font-bold">Check your email</h2>
-            <p className="mt-2 text-sm text-gray-600">
-              We sent a verification link to <strong>{email}</strong>
-            </p>
-          </div>
-          
-          <div className="rounded-lg bg-blue-50 p-4">
-            <p className="text-sm text-blue-800">
-              Click the link in the email to verify your account. If you don't see the email, check your spam folder.
-            </p>
-          </div>
-
-          <div className="text-center text-sm">
-            <span className="text-gray-600">Didn't receive the email? </span>
-            <button
-              onClick={() => setShowVerification(false)}
-              className="font-medium text-primary hover:underline"
-            >
-              Try again
-            </button>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-md space-y-8">
-        <div className="text-center">
-          <h2 className="text-3xl font-bold">Create your account</h2>
-          <p className="mt-2 text-sm text-gray-600">
-            Already have an account?{' '}
-            <Link href="/login" className="font-medium text-primary hover:underline">
-              Sign in
-            </Link>
-          </p>
-        </div>
-
-        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
-          {error && (
-            <Alert variant="destructive">
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
-
-          <div className="space-y-4">
-            <div>
-              <Label htmlFor="name">Name</Label>
-              <Input
-                id="name"
-                name="name"
-                type="text"
-                autoComplete="name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="John Doe"
-                className="mt-1"
-              />
-            </div>
-
-            <div>
-              <Label htmlFor="email">Email address</Label>
-              <Input
-                id="email"
-                name="email"
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="john@example.com"
-                className="mt-1"
-              />
-            </div>
-
-            <div>
-              <Label htmlFor="password">Password</Label>
-              <Input
-                id="password"
-                name="password"
-                type="password"
-                autoComplete="new-password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                className="mt-1"
-              />
-              <p className="mt-1 text-xs text-gray-500">
-                Must be at least 8 characters
-              </p>
-            </div>
-
-            <div>
-              <Label htmlFor="confirmPassword">Confirm password</Label>
-              <Input
-                id="confirmPassword"
-                name="confirmPassword"
-                type="password"
-                autoComplete="new-password"
-                required
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="••••••••"
-                className="mt-1"
-              />
-            </div>
-          </div>
-
-          <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? (
-              <>
-                <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
-                Creating account...
-              </>
-            ) : (
-              'Create account'
-            )}
-          </Button>
-
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <span className="w-full border-t" />
-            </div>
-            <div className="relative flex justify-center text-xs uppercase">
-              <span className="bg-background px-2 text-muted-foreground">
-                Or continue with
-              </span>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => handleOAuthSignIn('google')}
-              disabled={loading}
-            >
-              <Icons.google className="mr-2 h-4 w-4" />
-              Google
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => handleOAuthSignIn('github')}
-              disabled={loading}
-            >
-              <Icons.github className="mr-2 h-4 w-4" />
-              GitHub
-            </Button>
-          </div>
-
-          <p className="text-center text-xs text-gray-600">
-            By creating an account, you agree to our{' '}
-            <Link href="/terms" className="underline hover:text-gray-900">
-              Terms of Service
-            </Link>{' '}
-            and{' '}
-            <Link href="/privacy" className="underline hover:text-gray-900">
-              Privacy Policy
-            </Link>
-          </p>
-        </form>
-      </div>
-    </div>
-  )
-}
-
-
-
-
-
-
-// src/components/ui/alert.tsx
-import * as React from "react"
-import { cva, type VariantProps } from "class-variance-authority"
-import { cn } from "@/lib/utils"
-
-const alertVariants = cva(
-  "relative w-full rounded-lg border p-4 [&>svg~*]:pl-7 [&>svg+div]:translate-y-[-3px] [&>svg]:absolute [&>svg]:left-4 [&>svg]:top-4 [&>svg]:text-foreground",
-  {
-    variants: {
-      variant: {
-        default: "bg-background text-foreground",
-        destructive:
-          "border-destructive/50 text-destructive dark:border-destructive [&>svg]:text-destructive",
-      },
-    },
-    defaultVariants: {
-      variant: "default",
-    },
-  }
-)
-
-const Alert = React.forwardRef<
-  HTMLDivElement,
-  React.HTMLAttributes<HTMLDivElement> & VariantProps<typeof alertVariants>
->(({ className, variant, ...props }, ref) => (
-  <div
-    ref={ref}
-    role="alert"
-    className={cn(alertVariants({ variant }), className)}
-    {...props}
-  />
-))
-Alert.displayName = "Alert"
-
-const AlertTitle = React.forwardRef<
-  HTMLParagraphElement,
-  React.HTMLAttributes<HTMLHeadingElement>
->(({ className, ...props }, ref) => (
-  <h5
-    ref={ref}
-    className={cn("mb-1 font-medium leading-none tracking-tight", className)}
-    {...props}
-  />
-))
-AlertTitle.displayName = "AlertTitle"
-
-const AlertDescription = React.forwardRef<
-  HTMLParagraphElement,
-  React.HTMLAttributes<HTMLParagraphElement>
->(({ className, ...props }, ref) => (
-  <div
-    ref={ref}
-    className={cn("text-sm [&_p]:leading-relaxed", className)}
-    {...props}
-  />
-))
-AlertDescription.displayName = "AlertDescription"
-
-export { Alert, AlertTitle, AlertDescription }
-
-
-
-
-// src/components/ui/select.tsx
-'use client'
-
-import * as React from "react"
-import * as SelectPrimitive from "@radix-ui/react-select"
-import { Check, ChevronDown, ChevronUp } from "lucide-react"
-import { cn } from "@/lib/utils"
-
-const Select = SelectPrimitive.Root
-
-const SelectGroup = SelectPrimitive.Group
-
-const SelectValue = SelectPrimitive.Value
-
-const SelectTrigger = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Trigger>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger>
->(({ className, children, ...props }, ref) => (
-  <SelectPrimitive.Trigger
-    ref={ref}
-    className={cn(
-      "flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 [&>span]:line-clamp-1",
-      className
-    )}
-    {...props}
-  >
-    {children}
-    <SelectPrimitive.Icon asChild>
-      <ChevronDown className="h-4 w-4 opacity-50" />
-    </SelectPrimitive.Icon>
-  </SelectPrimitive.Trigger>
-))
-SelectTrigger.displayName = SelectPrimitive.Trigger.displayName
-
-const SelectScrollUpButton = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.ScrollUpButton>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.ScrollUpButton>
->(({ className, ...props }, ref) => (
-  <SelectPrimitive.ScrollUpButton
-    ref={ref}
-    className={cn(
-      "flex cursor-default items-center justify-center py-1",
-      className
-    )}
-    {...props}
-  >
-    <ChevronUp className="h-4 w-4" />
-  </SelectPrimitive.ScrollUpButton>
-))
-SelectScrollUpButton.displayName = SelectPrimitive.ScrollUpButton.displayName
-
-const SelectScrollDownButton = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.ScrollDownButton>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.ScrollDownButton>
->(({ className, ...props }, ref) => (
-  <SelectPrimitive.ScrollDownButton
-    ref={ref}
-    className={cn(
-      "flex cursor-default items-center justify-center py-1",
-      className
-    )}
-    {...props}
-  >
-    <ChevronDown className="h-4 w-4" />
-  </SelectPrimitive.ScrollDownButton>
-))
-SelectScrollDownButton.displayName =
-  SelectPrimitive.ScrollDownButton.displayName
-
-const SelectContent = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Content>
->(({ className, children, position = "popper", ...props }, ref) => (
-  <SelectPrimitive.Portal>
-    <SelectPrimitive.Content
-      ref={ref}
-      className={cn(
-        "relative z-50 max-h-96 min-w-[8rem] overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
-        position === "popper" &&
-          "data-[side=bottom]:translate-y-1 data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1 data-[side=top]:-translate-y-1",
-        className
-      )}
-      position={position}
-      {...props}
-    >
-      <SelectScrollUpButton />
-      <SelectPrimitive.Viewport
-        className={cn(
-          "p-1",
-          position === "popper" &&
-            "h-[var(--radix-select-trigger-height)] w-full min-w-[var(--radix-select-trigger-width)]"
-        )}
-      >
-        {children}
-      </SelectPrimitive.Viewport>
-      <SelectScrollDownButton />
-    </SelectPrimitive.Content>
-  </SelectPrimitive.Portal>
-))
-SelectContent.displayName = SelectPrimitive.Content.displayName
-
-const SelectLabel = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Label>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Label>
->(({ className, ...props }, ref) => (
-  <SelectPrimitive.Label
-    ref={ref}
-    className={cn("py-1.5 pl-8 pr-2 text-sm font-semibold", className)}
-    {...props}
-  />
-))
-SelectLabel.displayName = SelectPrimitive.Label.displayName
-
-const SelectItem = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
->(({ className, children, ...props }, ref) => (
-  <SelectPrimitive.Item
-    ref={ref}
-    className={cn(
-      "relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
-      className
-    )}
-    {...props}
-  >
-    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
-      <SelectPrimitive.ItemIndicator>
-        <Check className="h-4 w-4" />
-      </SelectPrimitive.ItemIndicator>
-    </span>
-
-    <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
-  </SelectPrimitive.Item>
-))
-SelectItem.displayName = SelectPrimitive.Item.displayName
-
-const SelectSeparator = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Separator>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Separator>
->(({ className, ...props }, ref) => (
-  <SelectPrimitive.Separator
-    ref={ref}
-    className={cn("-mx-1 my-1 h-px bg-muted", className)}
-    {...props}
-  />
-))
-SelectSeparator.displayName = SelectPrimitive.Separator.displayName
-
-export {
-  Select,
-  SelectGroup,
-  SelectValue,
-  SelectTrigger,
-  SelectContent,
-  SelectLabel,
-  SelectItem,
-  SelectSeparator,
-  SelectScrollUpButton,
-  SelectScrollDownButton,
-}
-
-
-
-
-// src/components/ui/table.tsx
-import * as React from "react"
-import { cn } from "@/lib/utils"
-
-const Table = React.forwardRef<
-  HTMLTableElement,
-  React.HTMLAttributes<HTMLTableElement>
->(({ className, ...props }, ref) => (
-  <div className="relative w-full overflow-auto">
-    <table
-      ref={ref}
-      className={cn("w-full caption-bottom text-sm", className)}
-      {...props}
-    />
-  </div>
-))
-Table.displayName = "Table"
-
-const TableHeader = React.forwardRef<
-  HTMLTableSectionElement,
-  React.HTMLAttributes<HTMLTableSectionElement>
->(({ className, ...props }, ref) => (
-  <thead ref={ref} className={cn("[&_tr]:border-b", className)} {...props} />
-))
-TableHeader.displayName = "TableHeader"
-
-const TableBody = React.forwardRef<
-  HTMLTableSectionElement,
-  React.HTMLAttributes<HTMLTableSectionElement>
->(({ className, ...props }, ref) => (
-  <tbody
-    ref={ref}
-    className={cn("[&_tr:last-child]:border-0", className)}
-    {...props}
-  />
-))
-TableBody.displayName = "TableBody"
-
-const TableFooter = React.forwardRef<
-  HTMLTableSectionElement,
-  React.HTMLAttributes<HTMLTableSectionElement>
->(({ className, ...props }, ref) => (
-  <tfoot
-    ref={ref}
-    className={cn(
-      "border-t bg-muted/50 font-medium [&>tr]:last:border-b-0",
-      className
-    )}
-    {...props}
-  />
-))
-TableFooter.displayName = "TableFooter"
-
-const TableRow = React.forwardRef<
-  HTMLTableRowElement,
-  React.HTMLAttributes<HTMLTableRowElement>
->(({ className, ...props }, ref) => (
-  <tr
-    ref={ref}
-    className={cn(
-      "border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted",
-      className
-    )}
-    {...props}
-  />
-))
-TableRow.displayName = "TableRow"
-
-const TableHead = React.forwardRef<
-  HTMLTableCellElement,
-  React.ThHTMLAttributes<HTMLTableCellElement>
->(({ className, ...props }, ref) => (
-  <th
-    ref={ref}
-    className={cn(
-      "h-12 px-4 text-left align-middle font-medium text-muted-foreground [&:has([role=checkbox])]:pr-0",
-      className
-    )}
-    {...props}
-  />
-))
-TableHead.displayName = "TableHead"
-
-const TableCell = React.forwardRef<
-  HTMLTableCellElement,
-  React.TdHTMLAttributes<HTMLTableCellElement>
->(({ className, ...props }, ref) => (
-  <td
-    ref={ref}
-    className={cn("p-4 align-middle [&:has([role=checkbox])]:pr-0", className)}
-    {...props}
-  />
-))
-TableCell.displayName = "TableCell"
-
-const TableCaption = React.forwardRef<
-  HTMLTableCaptionElement,
-  React.HTMLAttributes<HTMLTableCaptionElement>
->(({ className, ...props }, ref) => (
-  <caption
-    ref={ref}
-    className={cn("mt-4 text-sm text-muted-foreground", className)}
-    {...props}
-  />
-))
-TableCaption.displayName = "TableCaption"
-
-export {
-  Table,
-  TableHeader,
-  TableBody,
-  TableFooter,
-  TableHead,
-  TableRow,
-  TableCell,
-  TableCaption,
-}
-
-// src/components/ui/progress.tsx
-'use client'
-
-import * as React from "react"
-import * as ProgressPrimitive from "@radix-ui/react-progress"
-import { cn } from "@/lib/utils"
-
-const Progress = React.forwardRef<
-  React.ElementRef<typeof ProgressPrimitive.Root>,
-  React.ComponentPropsWithoutRef<typeof ProgressPrimitive.Root>
->(({ className, value, ...props }, ref) => (
-  <ProgressPrimitive.Root
-    ref={ref}
-    className={cn(
-      "relative h-4 w-full overflow-hidden rounded-full bg-secondary",
-      className
-    )}
-    {...props}
-  >
-    <ProgressPrimitive.Indicator
-      className="h-full w-full flex-1 bg-primary transition-all"
-      style={{ transform: `translateX(-${100 - (value || 0)}%)` }}
-    />
-  </ProgressPrimitive.Root>
-))
-Progress.displayName = ProgressPrimitive.Root.displayName
-
-export { Progress }
-
-
-
-
-// src/app/(auth)/reset-password/page.tsx
-'use client'
-
-import { useState, useEffect } from 'react'
-import { useRouter, useSearchParams } from 'next/navigation'
-import Link from 'next/link'
-import { useAuth } from '@/hooks/use-auth'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Icons } from '@/components/ui/icons'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-
-export default function ResetPasswordPage() {
-  const searchParams = useSearchParams()
-  const isPasswordReset = searchParams.get('type') === 'recovery'
-  
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [success, setSuccess] = useState(false)
-  const [loading, setLoading] = useState(false)
-  
-  const { resetPassword, updatePassword } = useAuth()
-  const router = useRouter()
-
-  // If user came from email link, show password update form
-  if (isPasswordReset) {
-    const handlePasswordUpdate = async (e: React.FormEvent) => {
-      e.preventDefault()
-      setError(null)
-
-      if (password !== confirmPassword) {
-        setError('Passwords do not match')
-        return
-      }
-
-      if (password.length < 8) {
-        setError('Password must be at least 8 characters')
-        return
-      }
-
-      setLoading(true)
-      const { error } = await updatePassword(password)
-
-      if (error) {
-        setError(error)
-        setLoading(false)
-        return
-      }
-
-      setSuccess(true)
-      setLoading(false)
-      
-      // Redirect to dashboard after 2 seconds
-      setTimeout(() => {
-        router.push('/dashboard')
-      }, 2000)
-    }
-
-    if (success) {
-      return (
-        <div className="flex min-h-screen items-center justify-center px-4">
-          <div className="w-full max-w-md space-y-8 text-center">
-            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
-            <h2 className="text-2xl font-bold">Password updated successfully!</h2>
-            <p className="text-sm text-gray-600">
-              Redirecting you to the dashboard...
-            </p>
-          </div>
-        </div>
-      )
-    }
-
-    return (
-      <div className="flex min-h-screen items-center justify-center px-4">
-        <div className="w-full max-w-md space-y-8">
-          <div className="text-center">
-            <h2 className="text-3xl font-bold">Set new password</h2>
-            <p className="mt-2 text-sm text-gray-600">
-              Please enter your new password below
-            </p>
-          </div>
-
-          <form className="mt-8 space-y-6" onSubmit={handlePasswordUpdate}>
-            {error && (
-              <Alert variant="destructive">
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            )}
-
-            <div className="space-y-4">
-              <div>
-                <Label htmlFor="password">New password</Label>
-                <Input
-                  id="password"
-                  name="password"
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="mt-1"
-                />
-                <p className="mt-1 text-xs text-gray-500">
-                  Must be at least 8 characters
-                </p>
-              </div>
-
-              <div>
-                <Label htmlFor="confirmPassword">Confirm new password</Label>
-                <Input
-                  id="confirmPassword"
-                  name="confirmPassword"
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="mt-1"
-                />
-              </div>
-            </div>
-
-            <Button type="submit" className="w-full" disabled={loading}>
-              {loading ? (
-                <>
-                  <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
-                  Updating password...
-                </>
-              ) : (
-                'Update password'
-              )}
-            </Button>
-          </form>
-        </div>
-      </div>
-    )
-  }
-
-  // Otherwise show password reset request form
-  const handleResetRequest = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setError(null)
-    setLoading(true)
-
-    const { error } = await resetPassword(email)
-
-    if (error) {
-      setError(error)
-      setLoading(false)
-      return
-    }
-
-    setSuccess(true)
-    setLoading(false)
-  }
-
-  if (success) {
-    return (
-      <div className="flex min-h-screen items-center justify-center px-4">
-        <div className="w-full max-w-md space-y-8">
-          <div className="text-center">
-            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
-            <h2 className="mt-6 text-3xl font-bold">Check your email</h2>
-            <p className="mt-2 text-sm text-gray-600">
-              We sent a password reset link to <strong>{email}</strong>
-            </p>
-          </div>
-          
-          <div className="rounded-lg bg-blue-50 p-4">
-            <p className="text-sm text-blue-800">
-              Click the link in the email to reset your password. If you don't see the email, check your spam folder.
-            </p>
-          </div>
-
-          <div className="text-center">
-            <Link
-              href="/login"
-              className="text-sm font-medium text-primary hover:underline"
-            >
-              Back to sign in
-            </Link>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-md space-y-8">
-        <div className="text-center">
-          <h2 className="text-3xl font-bold">Forgot your password?</h2>
-          <p className="mt-2 text-sm text-gray-600">
-            No worries, we'll send you reset instructions
-          </p>
-        </div>
-
-        <form className="mt-8 space-y-6" onSubmit={handleResetRequest}>
-          {error && (
-            <Alert variant="destructive">
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
-
-          <div>
-            <Label htmlFor="email">Email address</Label>
-            <Input
-              id="email"
-              name="email"
-              type="email"
-              autoComplete="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="john@example.com"
-              className="mt-1"
-            />
-          </div>
-
-          <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? (
-              <>
-                <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
-                Sending reset link...
-              </>
-            ) : (
-              'Send reset link'
-            )}
-          </Button>
-
-          <div className="text-center">
-            <Link
-              href="/login"
-              className="text-sm font-medium text-primary hover:underline"
-            >
-              Back to sign in
-            </Link>
-          </div>
-        </form>
-      </div>
-    </div>
-  )
-}
-
-// src/app/auth/callback/route.ts
-import { createClient } from '@/lib/supabase/server'
-import { NextResponse } from 'next/server'
-
-export async function GET(request: Request) {
-  const { searchParams, origin } = new URL(request.url)
-  const code = searchParams.get('code')
-  const next = searchParams.get('next') ?? '/dashboard'
-
-  if (code) {
-    const supabase = createClient()
-    const { error } = await supabase.auth.exchangeCodeForSession(code)
-    
-    if (!error) {
-      return NextResponse.redirect(`${origin}${next}`)
-    }
-  }
-
-  // Return the user to an error page with instructions
-  return NextResponse.redirect(`${origin}/auth/error`)
-}
-
-// src/app/(auth)/auth/error/page.tsx
-export default function AuthErrorPage() {
-  return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-md space-y-8 text-center">
-        <div>
-          <h2 className="text-3xl font-bold text-red-600">Authentication Error</h2>
-          <p className="mt-2 text-sm text-gray-600">
-            There was a problem signing you in. Please try again.
-          </p>
-        </div>
-        
-        <div className="space-y-4">
-          <a
-            href="/login"
-            className="block w-full rounded-md bg-primary px-4 py-2 text-center text-sm font-medium text-white hover:bg-primary/90"
-          >
-            Back to Login
-          </a>
-          
-          <p className="text-xs text-gray-500">
-            If this problem persists, please contact support.
-          </p>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-
-
-// src/app/(auth)/login/page.tsx
-'use client'
-
-import { useState } from 'react'
-import { useRouter, useSearchParams } from 'next/navigation'
-import Link from 'next/link'
-import { useAuth } from '@/hooks/use-auth'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Icons } from '@/components/ui/icons'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-
-export default function LoginPage() {
-  const searchParams = useSearchParams()
-  const redirectTo = searchParams.get('redirectTo') || '/dashboard'
-  
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [magicLinkEmail, setMagicLinkEmail] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [magicLinkSent, setMagicLinkSent] = useState(false)
-  
-  const router = useRouter()
-  const { signIn, signInWithProvider } = useAuth()
-
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true)
-    setError(null)
-
-    const { error } = await signIn(email, password)
-
-    if (error) {
-      setError(error)
-      setLoading(false)
-      return
-    }
-
-    router.push(redirectTo)
-  }
-
-  const handleMagicLink = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const fetchBillingData = async () => {
     setLoading(true)
     setError(null)
 
     try {
-      const response = await fetch('/api/auth/magic-link', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: magicLinkEmail }),
-      })
+      // Fetch subscription
+      const { data: subData } = await supabase
+        .from('subscriptions')
+        .select('*')
+        .eq('user_id', user!.id)
+        .eq('status', 'ACTIVE')
+        .single()
 
-      const data = await response.json()
+      setSubscription(subData)
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to send magic link')
+      // Fetch payment methods and invoices from API
+      if (subData) {
+        const [methodsRes, invoicesRes] = await Promise.all([
+          fetch('/api/billing/payment-methods'),
+          fetch('/api/billing/invoices'),
+        ])
+
+        if (methodsRes.ok) {
+          const methodsData = await methodsRes.json()
+          setPaymentMethods(methodsData)
+        }
+
+        if (invoicesRes.ok) {
+          const invoicesData = await invoicesRes.json()
+          setInvoices(invoicesData)
+        }
       }
-
-      setMagicLinkSent(true)
     } catch (err: any) {
       setError(err.message)
     } finally {
@@ -1780,898 +476,938 @@ export default function LoginPage() {
     }
   }
 
-  const handleOAuthSignIn = async (provider: 'google' | 'github') => {
-    setError(null)
-    const { error } = await signInWithProvider(provider)
-    if (error) {
-      setError(error)
-    }
-  }
+  const subscribe = useCallback(
+    async (priceId: string) => {
+      setError(null)
 
-  if (magicLinkSent) {
-    return (
-      <div className="flex min-h-screen items-center justify-center px-4">
-        <div className="w-full max-w-md space-y-8">
-          <div className="text-center">
-            <Icons.check className="mx-auto h-12 w-12 text-green-600" />
-            <h2 className="mt-6 text-3xl font-bold">Check your email</h2>
-            <p className="mt-2 text-sm text-gray-600">
-              We sent a sign in link to <strong>{magicLinkEmail}</strong>
-            </p>
-          </div>
-          
-          <div className="rounded-lg bg-blue-50 p-4">
-            <p className="text-sm text-blue-800">
-              Click the link in the email to sign in. If you don't see the email, check your spam folder.
-            </p>
-          </div>
+      try {
+        const response = await fetch('/api/billing/create-checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            priceId,
+            successUrl: `${window.location.origin}/billing/success`,
+            cancelUrl: `${window.location.origin}/billing`,
+          }),
+        })
 
-          <button
-            onClick={() => setMagicLinkSent(false)}
-            className="block w-full text-center text-sm font-medium text-primary hover:underline"
-          >
-            Use a different email
-          </button>
-        </div>
-      </div>
-    )
-  }
+        const data = await response.json()
 
-  return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-md space-y-8">
-        <div className="text-center">
-          <h2 className="text-3xl font-bold">Sign in to your account</h2>
-          <p className="mt-2 text-sm text-gray-600">
-            Or{' '}
-            <Link href="/register" className="font-medium text-primary hover:underline">
-              create a new account
-            </Link>
-          </p>
-        </div>
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to create checkout session')
+        }
 
-        {error && (
-          <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-
-        <Tabs defaultValue="password" className="w-full">
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="password">Password</TabsTrigger>
-            <TabsTrigger value="magic-link">Magic Link</TabsTrigger>
-          </TabsList>
-          
-          <TabsContent value="password" className="mt-6">
-            <form onSubmit={handleLogin} className="space-y-6">
-              <div className="space-y-4">
-                <div>
-                  <Label htmlFor="email">Email address</Label>
-                  <Input
-                    id="email"
-                    name="email"
-                    type="email"
-                    autoComplete="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="john@example.com"
-                    className="mt-1"
-                  />
-                </div>
-                
-                <div>
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="password">Password</Label>
-                    <Link
-                      href="/reset-password"
-                      className="text-sm text-primary hover:underline"
-                    >
-                      Forgot password?
-                    </Link>
-                  </div>
-                  <Input
-                    id="password"
-                    name="password"
-                    type="password"
-                    autoComplete="current-password"
-                    required
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="mt-1"
-                  />
-                </div>
-              </div>
-
-              <Button type="submit" className="w-full" disabled={loading}>
-                {loading ? (
-                  <>
-                    <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
-                    Signing in...
-                  </>
-                ) : (
-                  'Sign in'
-                )}
-              </Button>
-            </form>
-          </TabsContent>
-          
-          <TabsContent value="magic-link" className="mt-6">
-            <form onSubmit={handleMagicLink} className="space-y-6">
-              <div>
-                <Label htmlFor="magic-email">Email address</Label>
-                <Input
-                  id="magic-email"
-                  name="email"
-                  type="email"
-                  autoComplete="email"
-                  required
-                  value={magicLinkEmail}
-                  onChange={(e) => setMagicLinkEmail(e.target.value)}
-                  placeholder="john@example.com"
-                  className="mt-1"
-                />
-                <p className="mt-2 text-xs text-gray-500">
-                  We'll send you a magic link to sign in without a password
-                </p>
-              </div>
-
-              <Button type="submit" className="w-full" disabled={loading}>
-                {loading ? (
-                  <>
-                    <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />
-                    Sending magic link...
-                  </>
-                ) : (
-                  'Send magic link'
-                )}
-              </Button>
-            </form>
-          </TabsContent>
-        </Tabs>
-
-        <div className="relative">
-          <div className="absolute inset-0 flex items-center">
-            <span className="w-full border-t" />
-          </div>
-          <div className="relative flex justify-center text-xs uppercase">
-            <span className="bg-background px-2 text-muted-foreground">
-              Or continue with
-            </span>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => handleOAuthSignIn('google')}
-            disabled={loading}
-          >
-            <Icons.google className="mr-2 h-4 w-4" />
-            Google
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => handleOAuthSignIn('github')}
-            disabled={loading}
-          >
-            <Icons.github className="mr-2 h-4 w-4" />
-            GitHub
-          </Button>
-        </div>
-
-        <p className="text-center text-xs text-gray-600">
-          By signing in, you agree to our{' '}
-          <Link href="/terms" className="underline hover:text-gray-900">
-            Terms of Service
-          </Link>{' '}
-          and{' '}
-          <Link href="/privacy" className="underline hover:text-gray-900">
-            Privacy Policy
-          </Link>
-        </p>
-      </div>
-    </div>
+        // Redirect to Stripe Checkout
+        window.location.href = data.url
+      } catch (err: any) {
+        setError(err.message)
+        throw err
+      }
+    },
+    []
   )
+
+  const updateSubscription = useCallback(
+    async (newPriceId: string) => {
+      if (!subscription) {
+        throw new Error('No active subscription')
+      }
+
+      setError(null)
+
+      try {
+        const response = await fetch('/api/billing/update-subscription', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            subscriptionId: subscription.stripe_subscription_id,
+            priceId: newPriceId,
+          }),
+        })
+
+        const data = await response.json()
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to update subscription')
+        }
+
+        await fetchBillingData()
+        return data
+      } catch (err: any) {
+        setError(err.message)
+        throw err
+      }
+    },
+    [subscription]
+  )
+
+  const cancelSubscription = useCallback(async () => {
+    if (!subscription) {
+      throw new Error('No active subscription')
+    }
+
+    setError(null)
+
+    try {
+      const response = await fetch('/api/billing/cancel-subscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subscriptionId: subscription.stripe_subscription_id,
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to cancel subscription')
+      }
+
+      await fetchBillingData()
+      return data
+    } catch (err: any) {
+      setError(err.message)
+      throw err
+    }
+  }, [subscription])
+
+  const resumeSubscription = useCallback(async () => {
+    if (!subscription) {
+      throw new Error('No subscription to resume')
+    }
+
+    setError(null)
+
+    try {
+      const response = await fetch('/api/billing/resume-subscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subscriptionId: subscription.stripe_subscription_id,
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to resume subscription')
+      }
+
+      await fetchBillingData()
+      return data
+    } catch (err: any) {
+      setError(err.message)
+      throw err
+    }
+  }, [subscription])
+
+  const openBillingPortal = useCallback(async () => {
+    setError(null)
+
+    try {
+      const response = await fetch('/api/billing/create-portal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          returnUrl: window.location.href,
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to open billing portal')
+      }
+
+      // Redirect to Stripe Customer Portal
+      window.location.href = data.url
+    } catch (err: any) {
+      setError(err.message)
+      throw err
+    }
+  }, [])
+
+  const addPaymentMethod = useCallback(async () => {
+    setError(null)
+
+    try {
+      const response = await fetch('/api/billing/create-setup-intent', {
+        method: 'POST',
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to create setup intent')
+      }
+
+      // You would typically use Stripe Elements here
+      // For now, redirect to billing portal
+      await openBillingPortal()
+    } catch (err: any) {
+      setError(err.message)
+      throw err
+    }
+  }, [openBillingPortal])
+
+  const removePaymentMethod = useCallback(
+    async (paymentMethodId: string) => {
+      setError(null)
+
+      try {
+        const response = await fetch('/api/billing/remove-payment-method', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paymentMethodId }),
+        })
+
+        const data = await response.json()
+
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to remove payment method')
+        }
+
+        await fetchBillingData()
+      } catch (err: any) {
+        setError(err.message)
+        throw err
+      }
+    },
+    []
+  )
+
+  const isSubscribed = subscription?.status === 'ACTIVE'
+  const isCanceled = subscription?.cancel_at_period_end === true
+  const subscriptionEndDate = subscription?.stripe_current_period_end
+    ? new Date(subscription.stripe_current_period_end)
+    : null
+
+  return {
+    subscription,
+    paymentMethods,
+    invoices,
+    loading,
+    error,
+    isSubscribed,
+    isCanceled,
+    subscriptionEndDate,
+    subscribe,
+    updateSubscription,
+    cancelSubscription,
+    resumeSubscription,
+    openBillingPortal,
+    addPaymentMethod,
+    removePaymentMethod,
+    refreshBilling: fetchBillingData,
+  }
 }
 
-
-
-
-
-// src/components/ui/tabs.tsx
+// src/hooks/use-subscription-limits.ts
 'use client'
 
-import * as React from "react"
-import * as TabsPrimitive from "@radix-ui/react-tabs"
-import { cn } from "@/lib/utils"
+import { useEffect, useState } from 'react'
+import { useAuth } from './use-auth'
 
-const Tabs = TabsPrimitive.Root
+interface SubscriptionLimits {
+  tier: string
+  limits: {
+    users?: number
+    projects?: number
+    storage?: number
+    apiCalls?: number
+    [key: string]: any
+  }
+}
 
-const TabsList = React.forwardRef<
-  React.ElementRef<typeof TabsPrimitive.List>,
-  React.ComponentPropsWithoutRef<typeof TabsPrimitive.List>
->(({ className, ...props }, ref) => (
-  <TabsPrimitive.List
-    ref={ref}
-    className={cn(
-      "inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground",
-      className
-    )}
-    {...props}
-  />
-))
-TabsList.displayName = TabsPrimitive.List.displayName
+interface Usage {
+  users: number
+  projects: number
+  storage: number
+  apiCalls: number
+}
 
-const TabsTrigger = React.forwardRef<
-  React.ElementRef<typeof TabsPrimitive.Trigger>,
-  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Trigger>
->(({ className, ...props }, ref) => (
-  <TabsPrimitive.Trigger
-    ref={ref}
-    className={cn(
-      "inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm",
-      className
-    )}
-    {...props}
-  />
-))
-TabsTrigger.displayName = TabsPrimitive.Trigger.displayName
+export function useSubscriptionLimits() {
+  const { user } = useAuth()
+  const [limits, setLimits] = useState<SubscriptionLimits | null>(null)
+  const [usage, setUsage] = useState<Usage | null>(null)
+  const [loading, setLoading] = useState(true)
 
-const TabsContent = React.forwardRef<
-  React.ElementRef<typeof TabsPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Content>
->(({ className, ...props }, ref) => (
-  <TabsPrimitive.Content
-    ref={ref}
-    className={cn(
-      "mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-      className
-    )}
-    {...props}
-  />
-))
-TabsContent.displayName = TabsPrimitive.Content.displayName
+  useEffect(() => {
+    if (user) {
+      fetchLimitsAndUsage()
+    } else {
+      setLimits(null)
+      setUsage(null)
+      setLoading(false)
+    }
+  }, [user])
 
-export { Tabs, TabsList, TabsTrigger, TabsContent }
+  const fetchLimitsAndUsage = async () => {
+    setLoading(true)
+
+    try {
+      const response = await fetch('/api/billing/limits')
+      const data = await response.json()
+
+      if (response.ok) {
+        setLimits(data.limits)
+        setUsage(data.usage)
+      }
+    } catch (error) {
+      console.error('Failed to fetch limits:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const checkLimit = (resource: keyof Usage): boolean => {
+    if (!limits || !usage) return true
+    
+    const limit = limits.limits[resource]
+    if (limit === -1) return true // Unlimited
+    
+    return usage[resource] < limit
+  }
+
+  const getUsagePercentage = (resource: keyof Usage): number => {
+    if (!limits || !usage) return 0
+    
+    const limit = limits.limits[resource]
+    if (!limit || limit === -1) return 0
+    
+    return Math.round((usage[resource] / limit) * 100)
+  }
+
+  return {
+    limits,
+    usage,
+    loading,
+    checkLimit,
+    getUsagePercentage,
+    isFreeTier: limits?.tier === 'free',
+    isPro: limits?.tier === 'pro',
+    isEnterprise: limits?.tier === 'enterprise',
+  }
+}
 
 
 
-
-// src/app/api/auth/magic-link/route.ts
+// src/app/api/billing/create-checkout/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
 import { z } from 'zod'
 
-const magicLinkSchema = z.object({
-  email: z.string().email('Invalid email address'),
+const createCheckoutSchema = z.object({
+  priceId: z.string(),
+  successUrl: z.string().url(),
+  cancelUrl: z.string().url(),
+  organizationId: z.string().optional(),
 })
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json()
-    const { email } = magicLinkSchema.parse(body)
-    
     const supabase = createClient()
-    
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
-      },
-    })
-
-    if (error) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: 400 }
-      )
-    }
-
-    return NextResponse.json({ success: true })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: error.errors[0].message },
-        { status: 400 }
-      )
-    }
-    
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
-  }
-}
-
-// src/app/api/auth/2fa/enable/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-
-export async function POST() {
-  const supabase = createClient()
-  
-  const { data: { user } } = await supabase.auth.getUser()
-  
-  if (!user) {
-    return NextResponse.json(
-      { error: 'Unauthorized' },
-      { status: 401 }
-    )
-  }
-
-  const { data, error } = await supabase.auth.mfa.enroll({
-    factorType: 'totp',
-  })
-
-  if (error) {
-    return NextResponse.json(
-      { error: error.message },
-      { status: 400 }
-    )
-  }
-
-  return NextResponse.json({
-    qrCode: data.totp.qr_code,
-    secret: data.totp.secret,
-    factorId: data.id,
-  })
-}
-
-// src/app/api/auth/2fa/verify/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { z } from 'zod'
-
-const verify2FASchema = z.object({
-  code: z.string().length(6),
-  factorId: z.string(),
-})
-
-export async function POST(request: Request) {
-  try {
-    const body = await request.json()
-    const { code, factorId } = verify2FASchema.parse(body)
-    
-    const supabase = createClient()
-    
-    const { data, error } = await supabase.auth.mfa.verify({
-      factorId,
-      code,
-    })
-
-    if (error) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: 400 }
-      )
-    }
-
-    return NextResponse.json({ success: true, data })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: error.errors[0].message },
-        { status: 400 }
-      )
-    }
-    
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
-  }
-}
-
-// src/app/api/auth/2fa/disable/route.ts
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { z } from 'zod'
-
-const disable2FASchema = z.object({
-  factorId: z.string(),
-})
-
-export async function POST(request: Request) {
-  try {
-    const body = await request.json()
-    const { factorId } = disable2FASchema.parse(body)
-    
-    const supabase = createClient()
-    
     const { data: { user } } = await supabase.auth.getUser()
     
     if (!user) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      )
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const { error } = await supabase.auth.mfa.unenroll({
-      factorId,
+    const body = await request.json()
+    const { priceId, successUrl, cancelUrl, organizationId } = createCheckoutSchema.parse(body)
+
+    const session = await BillingService.createCheckoutSession({
+      userId: user.id,
+      email: user.email!,
+      priceId,
+      successUrl,
+      cancelUrl,
+      metadata: organizationId ? { organizationId } : {},
     })
 
-    if (error) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: 400 }
-      )
-    }
-
-    return NextResponse.json({ success: true })
+    return NextResponse.json({ url: session.url })
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: error.errors[0].message },
-        { status: 400 }
-      )
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
     }
     
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
+    console.error('Checkout error:', error)
+    return NextResponse.json({ error: 'Failed to create checkout session' }, { status: 500 })
   }
 }
 
-// src/app/api/auth/sessions/route.ts
+// src/app/api/billing/create-portal/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
+import { z } from 'zod'
+
+const createPortalSchema = z.object({
+  returnUrl: z.string().url(),
+})
+
+export async function POST(request: Request) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Get user's Stripe customer ID
+    const { data: userData } = await supabase
+      .from('users')
+      .select('stripe_customer_id')
+      .eq('id', user.id)
+      .single()
+
+    if (!userData?.stripe_customer_id) {
+      return NextResponse.json({ error: 'No billing account found' }, { status: 404 })
+    }
+
+    const body = await request.json()
+    const { returnUrl } = createPortalSchema.parse(body)
+
+    const session = await BillingService.createPortalSession({
+      customerId: userData.stripe_customer_id,
+      returnUrl,
+    })
+
+    return NextResponse.json({ url: session.url })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
+    }
+    
+    console.error('Portal error:', error)
+    return NextResponse.json({ error: 'Failed to create portal session' }, { status: 500 })
+  }
+}
+
+// src/app/api/billing/cancel-subscription/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
+import { z } from 'zod'
+
+const cancelSubscriptionSchema = z.object({
+  subscriptionId: z.string(),
+})
+
+export async function POST(request: Request) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await request.json()
+    const { subscriptionId } = cancelSubscriptionSchema.parse(body)
+
+    // Verify user owns this subscription
+    const { data: subscription } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('stripe_subscription_id', subscriptionId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (!subscription) {
+      return NextResponse.json({ error: 'Subscription not found' }, { status: 404 })
+    }
+
+    const updatedSubscription = await BillingService.cancelSubscription(subscriptionId)
+
+    // Update local database
+    await supabase
+      .from('subscriptions')
+      .update({ cancel_at_period_end: true })
+      .eq('stripe_subscription_id', subscriptionId)
+
+    return NextResponse.json({ subscription: updatedSubscription })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
+    }
+    
+    console.error('Cancel subscription error:', error)
+    return NextResponse.json({ error: 'Failed to cancel subscription' }, { status: 500 })
+  }
+}
+
+// src/app/api/billing/resume-subscription/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
+import { z } from 'zod'
+
+const resumeSubscriptionSchema = z.object({
+  subscriptionId: z.string(),
+})
+
+export async function POST(request: Request) {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await request.json()
+    const { subscriptionId } = resumeSubscriptionSchema.parse(body)
+
+    // Verify user owns this subscription
+    const { data: subscription } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('stripe_subscription_id', subscriptionId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (!subscription) {
+      return NextResponse.json({ error: 'Subscription not found' }, { status: 404 })
+    }
+
+    const updatedSubscription = await BillingService.resumeSubscription(subscriptionId)
+
+    // Update local database
+    await supabase
+      .from('subscriptions')
+      .update({ cancel_at_period_end: false })
+      .eq('stripe_subscription_id', subscriptionId)
+
+    return NextResponse.json({ subscription: updatedSubscription })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: error.errors[0].message }, { status: 400 })
+    }
+    
+    console.error('Resume subscription error:', error)
+    return NextResponse.json({ error: 'Failed to resume subscription' }, { status: 500 })
+  }
+}
+
+// src/app/api/billing/invoices/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
 
 export async function GET() {
-  const supabase = createClient()
-  
-  const { data: { user } } = await supabase.auth.getUser()
-  
-  if (!user) {
-    return NextResponse.json(
-      { error: 'Unauthorized' },
-      { status: 401 }
-    )
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Get user's Stripe customer ID
+    const { data: userData } = await supabase
+      .from('users')
+      .select('stripe_customer_id')
+      .eq('id', user.id)
+      .single()
+
+    if (!userData?.stripe_customer_id) {
+      return NextResponse.json([])
+    }
+
+    const invoices = await BillingService.getInvoices(userData.stripe_customer_id)
+
+    // Format invoices for frontend
+    const formattedInvoices = invoices.map(invoice => ({
+      id: invoice.id,
+      amount_paid: invoice.amount_paid,
+      amount_due: invoice.amount_due,
+      currency: invoice.currency,
+      status: invoice.status,
+      created: invoice.created,
+      invoice_pdf: invoice.invoice_pdf,
+      hosted_invoice_url: invoice.hosted_invoice_url,
+    }))
+
+    return NextResponse.json(formattedInvoices)
+  } catch (error) {
+    console.error('Get invoices error:', error)
+    return NextResponse.json({ error: 'Failed to get invoices' }, { status: 500 })
   }
-
-  const { data, error } = await supabase
-    .from('sessions')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('created_at', { ascending: false })
-
-  if (error) {
-    return NextResponse.json(
-      { error: error.message },
-      { status: 400 }
-    )
-  }
-
-  return NextResponse.json(data)
 }
 
-export async function DELETE(request: Request) {
-  const { searchParams } = new URL(request.url)
-  const sessionId = searchParams.get('id')
-  
-  if (!sessionId) {
-    return NextResponse.json(
-      { error: 'Session ID required' },
-      { status: 400 }
-    )
-  }
-  
-  const supabase = createClient()
-  
-  const { data: { user } } = await supabase.auth.getUser()
-  
-  if (!user) {
-    return NextResponse.json(
-      { error: 'Unauthorized' },
-      { status: 401 }
-    )
-  }
+// src/app/api/billing/payment-methods/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
 
-  const { error } = await supabase
-    .from('sessions')
-    .delete()
-    .eq('id', sessionId)
-    .eq('user_id', user.id) // Ensure user can only delete their own sessions
+export async function GET() {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
 
-  if (error) {
-    return NextResponse.json(
-      { error: error.message },
-      { status: 400 }
-    )
+    // Get user's Stripe customer ID
+    const { data: userData } = await supabase
+      .from('users')
+      .select('stripe_customer_id')
+      .eq('id', user.id)
+      .single()
+
+    if (!userData?.stripe_customer_id) {
+      return NextResponse.json([])
+    }
+
+    const paymentMethods = await BillingService.getPaymentMethods(userData.stripe_customer_id)
+
+    // Get default payment method
+    const { stripe } = await import('@/lib/payments/stripe')
+    const customer = await stripe.customers.retrieve(userData.stripe_customer_id)
+    const defaultPaymentMethodId = (customer as any).invoice_settings?.default_payment_method
+
+    // Format payment methods for frontend
+    const formattedMethods = paymentMethods.map(method => ({
+      id: method.id,
+      brand: method.card?.brand || 'unknown',
+      last4: method.card?.last4 || '****',
+      exp_month: method.card?.exp_month || 0,
+      exp_year: method.card?.exp_year || 0,
+      is_default: method.id === defaultPaymentMethodId,
+    }))
+
+    return NextResponse.json(formattedMethods)
+  } catch (error) {
+    console.error('Get payment methods error:', error)
+    return NextResponse.json({ error: 'Failed to get payment methods' }, { status: 500 })
   }
+}
 
-  return NextResponse.json({ success: true })
+// src/app/api/billing/limits/route.ts
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { BillingService } from '@/lib/billing/service'
+
+export async function GET() {
+  try {
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Get subscription limits
+    const limits = await BillingService.getSubscriptionLimits(user.id)
+
+    // Get current usage (implement based on your needs)
+    const usage = {
+      users: 1, // Get from database
+      projects: 0, // Get from database
+      storage: 0, // Get from storage service
+      apiCalls: 0, // Get from analytics/logs
+    }
+
+    return NextResponse.json({ limits, usage })
+  } catch (error) {
+    console.error('Get limits error:', error)
+    return NextResponse.json({ error: 'Failed to get limits' }, { status: 500 })
+  }
 }
 
 
-
-
-// src/components/auth/two-factor-setup.tsx
+// src/app/(dashboard)/billing/page.tsx
 'use client'
 
 import { useState } from 'react'
-import { QRCodeSVG } from 'qrcode.react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { useBilling } from '@/hooks/use-billing'
+import { useSubscriptionLimits } from '@/hooks/use-subscription-limits'
+import { PricingTable } from '@/components/billing/pricing-table'
+import { CurrentPlan } from '@/components/billing/current-plan'
+import { PaymentMethods } from '@/components/billing/payment-methods'
+import { BillingHistory } from '@/components/billing/billing-history'
+import { UsageOverview } from '@/components/billing/usage-overview'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Icons } from '@/components/ui/icons'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription as DialogDesc } from '@/components/ui/dialog'
 
-interface TwoFactorSetupProps {
-  isEnabled?: boolean
-  onUpdate?: () => void
-}
+export default function BillingPage() {
+  const { subscription, loading, error, isSubscribed } = useBilling()
+  const { limits, usage } = useSubscriptionLimits()
 
-export function TwoFactorSetup({ isEnabled = false, onUpdate }: TwoFactorSetupProps) {
-  const [showSetup, setShowSetup] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [qrCode, setQrCode] = useState<string | null>(null)
-  const [secret, setSecret] = useState<string | null>(null)
-  const [factorId, setFactorId] = useState<string | null>(null)
-  const [verificationCode, setVerificationCode] = useState('')
-  const [setupComplete, setSetupComplete] = useState(false)
-
-  const enable2FA = async () => {
-    setLoading(true)
-    setError(null)
-
-    try {
-      const response = await fetch('/api/auth/2fa/enable', {
-        method: 'POST',
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to enable 2FA')
-      }
-
-      setQrCode(data.qrCode)
-      setSecret(data.secret)
-      setFactorId(data.factorId)
-      setShowSetup(true)
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px]">
+        <Icons.spinner className="h-8 w-8 animate-spin text-gray-400" />
+      </div>
+    )
   }
 
-  const verify2FA = async () => {
-    if (!factorId || !verificationCode) return
-
-    setLoading(true)
-    setError(null)
-
-    try {
-      const response = await fetch('/api/auth/2fa/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code: verificationCode,
-          factorId,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Invalid verification code')
-      }
-
-      setSetupComplete(true)
-      setTimeout(() => {
-        setShowSetup(false)
-        setSetupComplete(false)
-        setQrCode(null)
-        setSecret(null)
-        setVerificationCode('')
-        if (onUpdate) onUpdate()
-      }, 2000)
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const disable2FA = async () => {
-    if (!confirm('Are you sure you want to disable two-factor authentication?')) {
-      return
-    }
-
-    setLoading(true)
-    setError(null)
-
-    try {
-      // In a real app, you'd need to get the factor ID from somewhere
-      // For now, we'll assume it's stored or can be retrieved
-      const response = await fetch('/api/auth/2fa/disable', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          factorId: 'current-factor-id', // This should be the actual factor ID
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to disable 2FA')
-      }
-
-      if (onUpdate) onUpdate()
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
+  if (error) {
+    return (
+      <div className="p-8">
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      </div>
+    )
   }
 
   return (
-    <>
-      <Card>
-        <CardHeader>
-          <CardTitle>Two-Factor Authentication</CardTitle>
-          <CardDescription>
-            Add an extra layer of security to your account
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-2">
-              <div className={`h-3 w-3 rounded-full ${isEnabled ? 'bg-green-500' : 'bg-gray-300'}`} />
-              <span className="text-sm font-medium">
-                {isEnabled ? 'Enabled' : 'Disabled'}
-              </span>
-            </div>
-            <Button
-              onClick={isEnabled ? disable2FA : enable2FA}
-              variant={isEnabled ? 'destructive' : 'default'}
-              size="sm"
-              disabled={loading}
-            >
-              {loading && <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />}
-              {isEnabled ? 'Disable' : 'Enable'}
-            </Button>
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-3xl font-bold">Billing & Subscription</h1>
+        <p className="text-gray-600 mt-2">
+          Manage your subscription, payment methods, and billing history
+        </p>
+      </div>
+
+      {/* Current Plan Overview */}
+      <CurrentPlan />
+
+      {/* Usage Overview */}
+      {isSubscribed && <UsageOverview />}
+
+      <Tabs defaultValue={isSubscribed ? "billing" : "plans"} className="w-full">
+        <TabsList>
+          <TabsTrigger value="plans">Plans</TabsTrigger>
+          {isSubscribed && (
+            <>
+              <TabsTrigger value="billing">Billing</TabsTrigger>
+              <TabsTrigger value="invoices">Invoices</TabsTrigger>
+            </>
+          )}
+        </TabsList>
+
+        <TabsContent value="plans" className="mt-6">
+          <div className="space-y-4">
+            <h2 className="text-xl font-semibold">Available Plans</h2>
+            <PricingTable currentPlanId={subscription?.stripe_price_id} />
           </div>
+        </TabsContent>
 
-          {error && (
-            <Alert variant="destructive" className="mt-4">
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
-        </CardContent>
-      </Card>
-
-      <Dialog open={showSetup} onOpenChange={setShowSetup}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Set up Two-Factor Authentication</DialogTitle>
-            <DialogDesc>
-              Scan the QR code with your authenticator app
-            </DialogDesc>
-          </DialogHeader>
-
-          {setupComplete ? (
-            <div className="flex flex-col items-center space-y-4 py-8">
-              <Icons.check className="h-16 w-16 text-green-500" />
-              <p className="text-lg font-medium">2FA Enabled Successfully!</p>
-            </div>
-          ) : (
-            <div className="space-y-6">
-              {qrCode && (
-                <div className="flex flex-col items-center space-y-4">
-                  <div className="rounded-lg border bg-white p-4">
-                    <QRCodeSVG value={qrCode} size={200} />
-                  </div>
-                  
-                  <div className="w-full space-y-2">
-                    <p className="text-sm text-gray-600">
-                      Can't scan? Enter this code manually:
-                    </p>
-                    <code className="block rounded bg-gray-100 p-2 text-xs">
-                      {secret}
-                    </code>
-                  </div>
-                </div>
-              )}
-
-              <div className="space-y-2">
-                <Label htmlFor="code">Verification Code</Label>
-                <Input
-                  id="code"
-                  type="text"
-                  placeholder="000000"
-                  value={verificationCode}
-                  onChange={(e) => setVerificationCode(e.target.value)}
-                  maxLength={6}
-                />
-                <p className="text-xs text-gray-500">
-                  Enter the 6-digit code from your authenticator app
-                </p>
+        {isSubscribed && (
+          <>
+            <TabsContent value="billing" className="mt-6">
+              <div className="space-y-6">
+                <PaymentMethods />
               </div>
+            </TabsContent>
 
-              {error && (
-                <Alert variant="destructive">
-                  <AlertDescription>{error}</AlertDescription>
-                </Alert>
-              )}
-
-              <div className="flex space-x-2">
-                <Button
-                  variant="outline"
-                  onClick={() => setShowSetup(false)}
-                  className="flex-1"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={verify2FA}
-                  disabled={loading || verificationCode.length !== 6}
-                  className="flex-1"
-                >
-                  {loading && <Icons.spinner className="mr-2 h-4 w-4 animate-spin" />}
-                  Verify
-                </Button>
-              </div>
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
-    </>
+            <TabsContent value="invoices" className="mt-6">
+              <BillingHistory />
+            </TabsContent>
+          </>
+        )}
+      </Tabs>
+    </div>
   )
 }
 
-// src/components/auth/session-list.tsx
+// src/components/billing/current-plan.tsx
 'use client'
 
-import { useEffect, useState } from 'react'
-import { formatDistanceToNow } from 'date-fns'
+import { format } from 'date-fns'
+import { useBilling } from '@/hooks/use-billing'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Icons } from '@/components/ui/icons'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Icons } from '@/components/ui/icons'
 
-interface Session {
-  id: string
-  user_agent?: string
-  ip_address?: string
-  created_at: string
-  last_used_at?: string
-}
+export function CurrentPlan() {
+  const {
+    subscription,
+    isSubscribed,
+    isCanceled,
+    subscriptionEndDate,
+    cancelSubscription,
+    resumeSubscription,
+    openBillingPortal,
+    loading,
+  } = useBilling()
 
-export function SessionList() {
-  const [sessions, setSessions] = useState<Session[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const handleCancelSubscription = async () => {
+    if (!confirm('Are you sure you want to cancel your subscription?')) {
+      return
+    }
 
-  useEffect(() => {
-    fetchSessions()
-  }, [])
-
-  const fetchSessions = async () => {
     try {
-      const response = await fetch('/api/auth/sessions')
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to fetch sessions')
-      }
-
-      setSessions(data)
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
+      await cancelSubscription()
+    } catch (error) {
+      console.error('Failed to cancel subscription:', error)
     }
   }
 
-  const revokeSession = async (sessionId: string) => {
-    setDeletingId(sessionId)
-    setError(null)
-
+  const handleResumeSubscription = async () => {
     try {
-      const response = await fetch(`/api/auth/sessions?id=${sessionId}`, {
-        method: 'DELETE',
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to revoke session')
-      }
-
-      setSessions(sessions.filter(s => s.id !== sessionId))
-    } catch (err: any) {
-      setError(err.message)
-    } finally {
-      setDeletingId(null)
+      await resumeSubscription()
+    } catch (error) {
+      console.error('Failed to resume subscription:', error)
     }
   }
 
-  const parseUserAgent = (userAgent?: string) => {
-    if (!userAgent) return 'Unknown device'
-    
-    // Simple parser - in production, use a proper user agent parser
-    if (userAgent.includes('Chrome')) return 'Chrome'
-    if (userAgent.includes('Firefox')) return 'Firefox'
-    if (userAgent.includes('Safari')) return 'Safari'
-    if (userAgent.includes('Edge')) return 'Edge'
-    return 'Unknown browser'
+  if (!isSubscribed) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Current Plan</CardTitle>
+          <CardDescription>You are currently on the free plan</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-gray-600 mb-4">
+            Upgrade to a paid plan to unlock more features and remove limitations.
+          </p>
+          <Button>View Plans</Button>
+        </CardContent>
+      </Card>
+    )
   }
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Active Sessions</CardTitle>
-        <CardDescription>
-          Manage your active sessions and sign out from other devices
-        </CardDescription>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Current Plan</CardTitle>
+            <CardDescription>
+              {isCanceled
+                ? `Your subscription will end on ${format(subscriptionEndDate!, 'MMMM d, yyyy')}`
+                : 'Manage your subscription and billing'}
+            </CardDescription>
+          </div>
+          <Button variant="outline" onClick={openBillingPortal}>
+            <Icons.settings className="h-4 w-4 mr-2" />
+            Manage Billing
+          </Button>
+        </div>
       </CardHeader>
       <CardContent>
-        {loading ? (
-          <div className="flex items-center justify-center py-8">
-            <Icons.spinner className="h-8 w-8 animate-spin text-gray-400" />
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-lg font-medium">Pro Plan</p>
+              <p className="text-sm text-gray-600">$29/month</p>
+            </div>
+            <Badge variant={isCanceled ? 'destructive' : 'default'}>
+              {isCanceled ? 'Canceling' : 'Active'}
+            </Badge>
           </div>
-        ) : error ? (
-          <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        ) : sessions.length === 0 ? (
-          <p className="text-center text-sm text-gray-500 py-8">
-            No active sessions found
+
+          {isCanceled && (
+            <Alert>
+              <Icons.alertCircle className="h-4 w-4" />
+              <AlertDescription>
+                Your subscription is set to cancel at the end of the current billing period.
+                You'll still have access to Pro features until {format(subscriptionEndDate!, 'MMMM d, yyyy')}.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div className="flex space-x-2">
+            {isCanceled ? (
+              <Button onClick={handleResumeSubscription} disabled={loading}>
+                Resume Subscription
+              </Button>
+            ) : (
+              <Button variant="destructive" onClick={handleCancelSubscription} disabled={loading}>
+                Cancel Subscription
+              </Button>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+// src/components/billing/payment-methods.tsx
+'use client'
+
+import { useState } from 'react'
+import { useBilling } from '@/hooks/use-billing'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Icons } from '@/components/ui/icons'
+
+export function PaymentMethods() {
+  const { paymentMethods, removePaymentMethod, addPaymentMethod } = useBilling()
+  const [removingId, setRemovingId] = useState<string | null>(null)
+
+  const handleRemove = async (methodId: string) => {
+    if (!confirm('Are you sure you want to remove this payment method?')) {
+      return
+    }
+
+    setRemovingId(methodId)
+    try {
+      await removePaymentMethod(methodId)
+    } catch (error) {
+      console.error('Failed to remove payment method:', error)
+    } finally {
+      setRemovingId(null)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Payment Methods</CardTitle>
+            <CardDescription>Manage your payment methods</CardDescription>
+          </div>
+          <Button onClick={addPaymentMethod} size="sm">
+            <Icons.add className="h-4 w-4 mr-2" />
+            Add Method
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {paymentMethods.length === 0 ? (
+          <p className="text-sm text-gray-500 text-center py-8">
+            No payment methods on file
           </p>
         ) : (
-          <div className="space-y-4">
-            {sessions.map((session, index) => (
+          <div className="space-y-3">
+            {paymentMethods.map((method) => (
               <div
-                key={session.id}
-                className="flex items-center justify-between rounded-lg border p-4"
+                key={method.id}
+                className="flex items-center justify-between p-4 border rounded-lg"
               >
-                <div className="space-y-1">
-                  <div className="flex items-center space-x-2">
-                    <Icons.laptop className="h-4 w-4 text-gray-500" />
-                    <span className="text-sm font-medium">
-                      {parseUserAgent(session.user_agent)}
-                    </span>
-                    {index === 0 && (
-                      <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700">
-                        Current
-                      </span>
-                    )}
+                <div className="flex items-center space-x-3">
+                  <div className="h-8 w-12 bg-gray-100 rounded flex items-center justify-center text-xs font-medium">
+                    {method.brand.toUpperCase()}
                   </div>
-                  <p className="text-xs text-gray-500">
-                    {session.ip_address || 'Unknown IP'} •{' '}
-                    {formatDistanceToNow(new Date(session.created_at), {
-                      addSuffix: true,
-                    })}
-                  </p>
+                  <div>
+                    <p className="text-sm font-medium">•••• {method.last4}</p>
+                    <p className="text-xs text-gray-500">
+                      Expires {method.exp_month}/{method.exp_year}
+                    </p>
+                  </div>
+                  {method.is_default && (
+                    <Badge variant="secondary" className="text-xs">
+                      Default
+                    </Badge>
+                  )}
                 </div>
-                {index !== 0 && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => revokeSession(session.id)}
-                    disabled={deletingId === session.id}
-                  >
-                    {deletingId === session.id ? (
-                      <Icons.spinner className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Icons.logout className="h-4 w-4" />
-                    )}
-                    <span className="sr-only">Revoke session</span>
-                  </Button>
-                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleRemove(method.id)}
+                  disabled={removingId === method.id || method.is_default}
+                >
+                  {removingId === method.id ? (
+                    <Icons.spinner className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Icons.delete className="h-4 w-4" />
+                  )}
+                </Button>
               </div>
             ))}
           </div>
@@ -2680,3 +1416,793 @@ export function SessionList() {
     </Card>
   )
 }
+
+// src/components/billing/billing-history.tsx
+'use client'
+
+import { format } from 'date-fns'
+import { useBilling } from '@/hooks/use-billing'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Icons } from '@/components/ui/icons'
+
+export function BillingHistory() {
+  const { invoices } = useBilling()
+
+  const formatCurrency = (amount: number, currency: string) => {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency.toUpperCase(),
+    }).format(amount / 100)
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Billing History</CardTitle>
+        <CardDescription>Download your past invoices</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {invoices.length === 0 ? (
+          <p className="text-sm text-gray-500 text-center py-8">
+            No invoices yet
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {invoices.map((invoice) => (
+              <div
+                key={invoice.id}
+                className="flex items-center justify-between p-4 border rounded-lg"
+              >
+                <div>
+                  <p className="text-sm font-medium">
+                    {format(new Date(invoice.created * 1000), 'MMMM d, yyyy')}
+                  </p>
+                  <p className="text-sm text-gray-600">
+                    {formatCurrency(invoice.amount_paid, invoice.currency)}
+                  </p>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <Badge variant={invoice.status === 'paid' ? 'default' : 'secondary'}>
+                    {invoice.status}
+                  </Badge>
+                  {invoice.invoice_pdf && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      asChild
+                    >
+                      <a href={invoice.invoice_pdf} target="_blank" rel="noopener noreferrer">
+                        <Icons.download className="h-4 w-4" />
+                      </a>
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+
+// src/components/ui/badge.tsx
+import * as React from "react"
+import { cva, type VariantProps } from "class-variance-authority"
+import { cn } from "@/lib/utils"
+
+const badgeVariants = cva(
+  "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
+  {
+    variants: {
+      variant: {
+        default:
+          "border-transparent bg-primary text-primary-foreground hover:bg-primary/80",
+        secondary:
+          "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
+        destructive:
+          "border-transparent bg-destructive text-destructive-foreground hover:bg-destructive/80",
+        outline: "text-foreground",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+)
+
+export interface BadgeProps
+  extends React.HTMLAttributes<HTMLDivElement>,
+    VariantProps<typeof badgeVariants> {}
+
+function Badge({ className, variant, ...props }: BadgeProps) {
+  return (
+    <div className={cn(badgeVariants({ variant }), className)} {...props} />
+  )
+}
+
+export { Badge, badgeVariants }
+
+
+
+// src/components/billing/usage-overview.tsx
+'use client'
+
+import { useSubscriptionLimits } from '@/hooks/use-subscription-limits'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Progress } from '@/components/ui/progress'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Icons } from '@/components/ui/icons'
+import { cn } from '@/lib/utils'
+
+interface UsageItemProps {
+  label: string
+  used: number
+  limit: number
+  unit?: string
+}
+
+function UsageItem({ label, used, limit, unit = '' }: UsageItemProps) {
+  const percentage = limit === -1 ? 0 : Math.round((used / limit) * 100)
+  const isUnlimited = limit === -1
+  const isNearLimit = percentage >= 80 && !isUnlimited
+  const isAtLimit = percentage >= 100 && !isUnlimited
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between text-sm">
+        <span className="font-medium">{label}</span>
+        <span className="text-gray-600">
+          {used.toLocaleString()}{unit}
+          {!isUnlimited && ` / ${limit.toLocaleString()}${unit}`}
+          {isUnlimited && ' / Unlimited'}
+        </span>
+      </div>
+      {!isUnlimited && (
+        <Progress 
+          value={percentage} 
+          className={cn(
+            "h-2",
+            isAtLimit && "bg-red-100",
+            isNearLimit && !isAtLimit && "bg-orange-100"
+          )}
+        />
+      )}
+    </div>
+  )
+}
+
+export function UsageOverview() {
+  const { limits, usage, loading, isFreeTier } = useSubscriptionLimits()
+
+  if (loading || !limits || !usage) {
+    return null
+  }
+
+  const hasAnyLimitWarning = Object.keys(usage).some((key) => {
+    const limit = limits.limits[key as keyof typeof usage]
+    if (!limit || limit === -1) return false
+    const percentage = (usage[key as keyof typeof usage] / limit) * 100
+    return percentage >= 80
+  })
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Usage Overview</CardTitle>
+        <CardDescription>
+          Track your usage against your plan limits
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {hasAnyLimitWarning && (
+          <Alert>
+            <Icons.alertCircle className="h-4 w-4" />
+            <AlertDescription>
+              You're approaching one or more of your plan limits. Consider upgrading to continue growing.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <UsageItem
+            label="Team Members"
+            used={usage.users}
+            limit={limits.limits.users || 0}
+          />
+          <UsageItem
+            label="Projects"
+            used={usage.projects}
+            limit={limits.limits.projects || 0}
+          />
+          <UsageItem
+            label="Storage"
+            used={Math.round(usage.storage / (1024 * 1024))} // Convert to MB
+            limit={Math.round((limits.limits.storage || 0) / (1024 * 1024))}
+            unit="MB"
+          />
+          <UsageItem
+            label="API Calls (this month)"
+            used={usage.apiCalls}
+            limit={limits.limits.apiCalls || 0}
+          />
+        </div>
+
+        {isFreeTier && (
+          <div className="rounded-lg bg-gray-50 p-4 text-center">
+            <p className="text-sm text-gray-600">
+              Upgrade to Pro to unlock unlimited usage and advanced features
+            </p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+
+
+// src/app/(dashboard)/billing/success/page.tsx
+// Note: Install canvas-confetti: npm install canvas-confetti @types/canvas-confetti
+'use client'
+
+import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Icons } from '@/components/ui/icons'
+import confetti from 'canvas-confetti'
+
+export default function BillingSuccessPage() {
+  const router = useRouter()
+  const [countdown, setCountdown] = useState(5)
+
+  useEffect(() => {
+    // Fire confetti
+    confetti({
+      particleCount: 100,
+      spread: 70,
+      origin: { y: 0.6 },
+    })
+
+    // Countdown timer
+    const timer = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer)
+          router.push('/dashboard')
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [router])
+
+  return (
+    <div className="flex min-h-[600px] items-center justify-center">
+      <Card className="w-full max-w-md">
+        <CardHeader className="text-center">
+          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-green-100">
+            <Icons.check className="h-8 w-8 text-green-600" />
+          </div>
+          <CardTitle className="text-2xl">Welcome to Pro!</CardTitle>
+          <CardDescription>
+            Your subscription has been activated successfully
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="space-y-2 text-center">
+            <p className="text-sm text-gray-600">
+              You now have access to all Pro features:
+            </p>
+            <ul className="space-y-1 text-sm">
+              <li>✓ Unlimited users and projects</li>
+              <li>✓ Priority support</li>
+              <li>✓ Advanced analytics</li>
+              <li>✓ Custom integrations</li>
+            </ul>
+          </div>
+
+          <div className="space-y-3">
+            <Button 
+              className="w-full" 
+              onClick={() => router.push('/dashboard')}
+            >
+              Go to Dashboard
+            </Button>
+            <p className="text-center text-xs text-gray-500">
+              Redirecting in {countdown} seconds...
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+
+
+// src/lib/email/service.ts
+import { resend } from './client'
+import { createClient } from '@/lib/supabase/server'
+import WelcomeEmail from '@/emails/welcome'
+import ResetPasswordEmail from '@/emails/reset-password'
+import TeamInvitationEmail from '@/emails/team-invitation'
+import InvoiceEmail from '@/emails/invoice'
+import { z } from 'zod'
+
+// Email types
+export const EmailType = {
+  WELCOME: 'welcome',
+  RESET_PASSWORD: 'reset_password',
+  TEAM_INVITATION: 'team_invitation',
+  INVOICE: 'invoice',
+  SUBSCRIPTION_CREATED: 'subscription_created',
+  SUBSCRIPTION_UPDATED: 'subscription_updated',
+  SUBSCRIPTION_CANCELLED: 'subscription_cancelled',
+  PAYMENT_FAILED: 'payment_failed',
+} as const
+
+export type EmailType = typeof EmailType[keyof typeof EmailType]
+
+// Email queue schema
+const emailQueueSchema = z.object({
+  id: z.string().optional(),
+  to: z.union([z.string().email(), z.array(z.string().email())]),
+  type: z.nativeEnum(EmailType),
+  data: z.record(z.any()),
+  status: z.enum(['pending', 'sent', 'failed']).default('pending'),
+  attempts: z.number().default(0),
+  error: z.string().optional(),
+  sent_at: z.string().optional(),
+  created_at: z.string().optional(),
+})
+
+export type EmailQueueItem = z.infer<typeof emailQueueSchema>
+
+export class EmailService {
+  // Queue an email for sending
+  static async queue(email: Omit<EmailQueueItem, 'id' | 'created_at'>) {
+    const supabase = createClient()
+    
+    const { data, error } = await supabase
+      .from('email_queue')
+      .insert({
+        ...email,
+        to: Array.isArray(email.to) ? email.to : [email.to],
+      })
+      .select()
+      .single()
+
+    if (error) {
+      throw new Error(`Failed to queue email: ${error.message}`)
+    }
+
+    // Try to send immediately
+    await this.processQueueItem(data)
+
+    return data
+  }
+
+  // Process a single queue item
+  static async processQueueItem(item: EmailQueueItem) {
+    const supabase = createClient()
+
+    try {
+      // Get email template based on type
+      const { subject, react, text } = await this.getEmailTemplate(item.type, item.data)
+
+      // Send email
+      const result = await resend.emails.send({
+        from: process.env.FROM_EMAIL!,
+        to: item.to,
+        subject,
+        react,
+        text,
+      })
+
+      if (result.error) {
+        throw new Error(result.error.message)
+      }
+
+      // Update queue item as sent
+      await supabase
+        .from('email_queue')
+        .update({
+          status: 'sent',
+          sent_at: new Date().toISOString(),
+        })
+        .eq('id', item.id)
+
+      return { success: true }
+    } catch (error: any) {
+      // Update queue item with error
+      await supabase
+        .from('email_queue')
+        .update({
+          status: 'failed',
+          attempts: item.attempts + 1,
+          error: error.message,
+        })
+        .eq('id', item.id)
+
+      throw error
+    }
+  }
+
+  // Process all pending emails in queue
+  static async processQueue() {
+    const supabase = createClient()
+    
+    // Get pending emails (max 3 attempts)
+    const { data: items } = await supabase
+      .from('email_queue')
+      .select('*')
+      .eq('status', 'pending')
+      .lt('attempts', 3)
+      .order('created_at', { ascending: true })
+      .limit(10)
+
+    if (!items) return
+
+    // Process each item
+    const results = await Promise.allSettled(
+      items.map(item => this.processQueueItem(item))
+    )
+
+    return results
+  }
+
+  // Get email template based on type
+  static async getEmailTemplate(type: EmailType, data: any) {
+    switch (type) {
+      case EmailType.WELCOME:
+        return {
+          subject: 'Welcome to Our Platform!',
+          react: WelcomeEmail({
+            userFirstName: data.name || 'there',
+            loginLink: `${process.env.NEXT_PUBLIC_APP_URL}/login`,
+          }),
+          text: `Welcome ${data.name || ''}! We're excited to have you on board.`,
+        }
+
+      case EmailType.RESET_PASSWORD:
+        return {
+          subject: 'Reset Your Password',
+          react: ResetPasswordEmail({
+            resetLink: data.resetLink,
+            userName: data.name,
+          }),
+          text: `Click here to reset your password: ${data.resetLink}`,
+        }
+
+      case EmailType.TEAM_INVITATION:
+        return {
+          subject: `You're invited to join ${data.teamName}`,
+          react: TeamInvitationEmail({
+            inviteLink: data.inviteLink,
+            inviterName: data.inviterName,
+            teamName: data.teamName,
+            recipientEmail: data.recipientEmail,
+          }),
+          text: `${data.inviterName} has invited you to join ${data.teamName}. Click here to accept: ${data.inviteLink}`,
+        }
+
+      case EmailType.INVOICE:
+        return {
+          subject: `Invoice #${data.invoiceNumber}`,
+          react: InvoiceEmail({
+            invoiceNumber: data.invoiceNumber,
+            customerName: data.customerName,
+            amount: data.amount,
+            dueDate: data.dueDate,
+            items: data.items,
+            downloadLink: data.downloadLink,
+          }),
+          text: `Your invoice #${data.invoiceNumber} for ${data.amount} is ready.`,
+        }
+
+      case EmailType.SUBSCRIPTION_CREATED:
+        return {
+          subject: 'Subscription Activated',
+          react: (
+            <div>
+              <h1>Welcome to Pro!</h1>
+              <p>Your subscription has been activated successfully.</p>
+              <p>You now have access to all Pro features.</p>
+            </div>
+          ),
+          text: 'Your Pro subscription has been activated.',
+        }
+
+      case EmailType.SUBSCRIPTION_UPDATED:
+        return {
+          subject: 'Subscription Updated',
+          react: (
+            <div>
+              <h1>Subscription Updated</h1>
+              <p>Your subscription has been updated successfully.</p>
+            </div>
+          ),
+          text: 'Your subscription has been updated.',
+        }
+
+      case EmailType.SUBSCRIPTION_CANCELLED:
+        return {
+          subject: 'Subscription Cancelled',
+          react: (
+            <div>
+              <h1>Subscription Cancelled</h1>
+              <p>Your subscription has been cancelled and will end on {data.endDate}.</p>
+              <p>You'll continue to have access until then.</p>
+            </div>
+          ),
+          text: `Your subscription has been cancelled and will end on ${data.endDate}.`,
+        }
+
+      case EmailType.PAYMENT_FAILED:
+        return {
+          subject: 'Payment Failed',
+          react: (
+            <div>
+              <h1>Payment Failed</h1>
+              <p>We couldn't process your payment. Please update your payment method.</p>
+              <a href={`${process.env.NEXT_PUBLIC_APP_URL}/billing`}>Update Payment Method</a>
+            </div>
+          ),
+          text: 'Your payment failed. Please update your payment method.',
+        }
+
+      default:
+        throw new Error(`Unknown email type: ${type}`)
+    }
+  }
+
+  // Send email immediately (bypasses queue)
+  static async send({
+    to,
+    subject,
+    react,
+    text,
+  }: {
+    to: string | string[]
+    subject: string
+    react?: React.ReactElement
+    text?: string
+  }) {
+    const result = await resend.emails.send({
+      from: process.env.FROM_EMAIL!,
+      to,
+      subject,
+      react,
+      text,
+    })
+
+    if (result.error) {
+      throw new Error(result.error.message)
+    }
+
+    return result
+  }
+
+  // Helper methods for common emails
+  static async sendWelcomeEmail(user: { email: string; name?: string }) {
+    return this.queue({
+      to: user.email,
+      type: EmailType.WELCOME,
+      data: { name: user.name },
+      status: 'pending',
+      attempts: 0,
+    })
+  }
+
+  static async sendPasswordResetEmail(email: string, resetLink: string, name?: string) {
+    return this.queue({
+      to: email,
+      type: EmailType.RESET_PASSWORD,
+      data: { resetLink, name },
+      status: 'pending',
+      attempts: 0,
+    })
+  }
+
+  static async sendTeamInvitationEmail({
+    to,
+    inviteLink,
+    inviterName,
+    teamName,
+  }: {
+    to: string
+    inviteLink: string
+    inviterName: string
+    teamName: string
+  }) {
+    return this.queue({
+      to,
+      type: EmailType.TEAM_INVITATION,
+      data: {
+        inviteLink,
+        inviterName,
+        teamName,
+        recipientEmail: to,
+      },
+      status: 'pending',
+      attempts: 0,
+    })
+  }
+
+  static async sendInvoiceEmail({
+    to,
+    invoice,
+  }: {
+    to: string
+    invoice: {
+      number: string
+      customerName: string
+      amount: string
+      dueDate: string
+      items: any[]
+      downloadLink: string
+    }
+  }) {
+    return this.queue({
+      to,
+      type: EmailType.INVOICE,
+      data: {
+        invoiceNumber: invoice.number,
+        customerName: invoice.customerName,
+        amount: invoice.amount,
+        dueDate: invoice.dueDate,
+        items: invoice.items,
+        downloadLink: invoice.downloadLink,
+      },
+      status: 'pending',
+      attempts: 0,
+    })
+  }
+}
+
+// src/lib/email/templates/subscription-emails.tsx
+import * as React from 'react'
+import {
+  Body,
+  Button,
+  Container,
+  Head,
+  Heading,
+  Html,
+  Link,
+  Preview,
+  Text,
+} from '@react-email/components'
+
+const baseStyles = {
+  main: {
+    backgroundColor: '#f6f9fc',
+    fontFamily:
+      '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Ubuntu,sans-serif',
+  },
+  container: {
+    backgroundColor: '#ffffff',
+    margin: '0 auto',
+    padding: '20px 0 48px',
+    marginBottom: '64px',
+  },
+  h1: {
+    color: '#333',
+    fontSize: '24px',
+    fontWeight: 'bold',
+    textAlign: 'center' as const,
+    margin: '30px 0',
+  },
+  text: {
+    color: '#333',
+    fontSize: '16px',
+    lineHeight: '26px',
+    textAlign: 'left' as const,
+  },
+  button: {
+    backgroundColor: '#5469d4',
+    borderRadius: '4px',
+    color: '#fff',
+    fontSize: '16px',
+    textDecoration: 'none',
+    textAlign: 'center' as const,
+    display: 'block',
+    width: '200px',
+    margin: '30px auto',
+    padding: '12px',
+  },
+}
+
+export function SubscriptionCreatedEmail({ userName }: { userName?: string }) {
+  return (
+    <Html>
+      <Head />
+      <Preview>Your subscription is now active</Preview>
+      <Body style={baseStyles.main}>
+        <Container style={baseStyles.container}>
+          <Heading style={baseStyles.h1}>Welcome to Pro!</Heading>
+          <Text style={baseStyles.text}>
+            Hi {userName || 'there'},
+          </Text>
+          <Text style={baseStyles.text}>
+            Your Pro subscription is now active! You have access to all premium features.
+          </Text>
+          <Button href={`${process.env.NEXT_PUBLIC_APP_URL}/dashboard`} style={baseStyles.button}>
+            Go to Dashboard
+          </Button>
+        </Container>
+      </Body>
+    </Html>
+  )
+}
+
+
+-- supabase/migrations/20240102000000_create_email_queue.sql
+
+-- Create email queue table
+CREATE TABLE IF NOT EXISTS email_queue (
+  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  to TEXT[] NOT NULL,
+  type VARCHAR(50) NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}',
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  sent_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes
+CREATE INDEX idx_email_queue_status ON email_queue(status);
+CREATE INDEX idx_email_queue_created_at ON email_queue(created_at);
+CREATE INDEX idx_email_queue_type ON email_queue(type);
+
+-- Create updated_at trigger
+CREATE TRIGGER update_email_queue_updated_at
+  BEFORE UPDATE ON email_queue
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+
+-- Create function to clean old emails (optional)
+CREATE OR REPLACE FUNCTION clean_old_emails()
+RETURNS void AS $$
+BEGIN
+  DELETE FROM email_queue
+  WHERE status = 'sent' AND sent_at < NOW() - INTERVAL '30 days';
+  
+  DELETE FROM email_queue
+  WHERE status = 'failed' AND attempts >= 3 AND created_at < NOW() - INTERVAL '7 days';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Add RLS policies
+ALTER TABLE email_queue ENABLE ROW LEVEL SECURITY;
+
+-- Only service role can access email queue
+CREATE POLICY "Service role can manage email queue" ON email_queue
+  FOR ALL USING (auth.role() = 'service_role');
+
+-- Create email templates table (optional)
+CREATE TABLE IF NOT EXISTS email_templates (
+  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  name VARCHAR(100) UNIQUE NOT NULL,
+  subject TEXT NOT NULL,
+  html_template TEXT,
+  text_template TEXT,
+  variables JSONB DEFAULT '[]',
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create trigger for email_templates
+CREATE TRIGGER update_email_templates_updated_at
+  BEFORE UPDATE ON email_templates
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
