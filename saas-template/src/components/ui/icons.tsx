@@ -21,7 +21,11 @@ import {
   Sun,
   Moon,
   Laptop,
-} from 'lucide-react'
+  Users,
+  Activity,
+  DollarSign,
+  TrendingUp,
+} from "lucide-react";
 
 export const Icons = {
   spinner: Loader2,
@@ -46,6 +50,10 @@ export const Icons = {
   sun: Sun,
   moon: Moon,
   laptop: Laptop,
+  users: Users,
+  activity: Activity,
+  dollarSign: DollarSign,
+  trendingUp: TrendingUp,
   google: (props: any) => (
     <svg role="img" viewBox="0 0 24 24" {...props}>
       <path
@@ -62,4 +70,4 @@ export const Icons = {
       />
     </svg>
   ),
-}
+};
