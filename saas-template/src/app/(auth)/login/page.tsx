@@ -1,83 +1,81 @@
-"use client";
+'use client'
 
-import { useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
-import Link from "next/link";
-import { useAuth } from "@/hooks/use-auth";
-import { OAuthButtons } from "@/components/auth/oauth-button";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Icons } from "@/components/ui/icons";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Separator } from "@/components/ui/separator";
+import { useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import Link from 'next/link'
+import { useAuth } from '@/hooks/use-auth'
+import { OAuthButtons } from '@/components/auth/oauth-button'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Icons } from '@/components/ui/icons'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Separator } from '@/components/ui/separator'
 
 export default function LoginPage() {
-  const searchParams = useSearchParams();
-  const redirectTo = searchParams.get("redirectTo") || "/dashboard";
-
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [magicLinkEmail, setMagicLinkEmail] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [magicLinkSent, setMagicLinkSent] = useState(false);
-
-  const router = useRouter();
-  const { signIn, signInWithProvider } = useAuth();
+  const searchParams = useSearchParams()
+  const redirectTo = searchParams.get('redirectTo') || '/dashboard'
+  
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [magicLinkEmail, setMagicLinkEmail] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [magicLinkSent, setMagicLinkSent] = useState(false)
+  
+  const router = useRouter()
+  const { signIn, signInWithProvider } = useAuth()
 
   const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
+    e.preventDefault()
+    setLoading(true)
+    setError(null)
 
-    const { error } = await signIn(email, password);
+    const { error } = await signIn(email, password)
 
     if (error) {
-      setError(error);
-      setLoading(false);
-      return;
+      setError(error)
+      setLoading(false)
+      return
     }
 
-    router.push(redirectTo);
-  };
+    router.push(redirectTo)
+  }
 
   const handleMagicLink = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
+    e.preventDefault()
+    setLoading(true)
+    setError(null)
 
     try {
-      const response = await fetch("/api/auth/magic-link", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+      const response = await fetch('/api/auth/magic-link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: magicLinkEmail }),
-      });
+      })
 
-      const data = await response.json();
+      const data = await response.json()
 
       if (!response.ok) {
-        throw new Error(data.error || "Failed to send magic link");
+        throw new Error(data.error || 'Failed to send magic link')
       }
 
-      setMagicLinkSent(true);
+      setMagicLinkSent(true)
     } catch (err: any) {
-      setError(err.message);
+      setError(err.message)
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  };
+  }
 
-  const handleOAuthSignIn = async (
-    provider: "google" | "github" | "discord"
-  ) => {
-    setError(null);
-    const { error } = await signInWithProvider(provider as "google" | "github");
+  const handleOAuthSignIn = async (provider: 'google' | 'github' | 'discord') => {
+    setError(null)
+    const { error } = await signInWithProvider(provider as 'google' | 'github')
     if (error) {
-      setError(error);
+      setError(error)
     }
-  };
+  }
 
   if (magicLinkSent) {
     return (
@@ -90,11 +88,10 @@ export default function LoginPage() {
               We sent a sign in link to <strong>{magicLinkEmail}</strong>
             </p>
           </div>
-
+          
           <div className="rounded-lg bg-blue-50 p-4">
             <p className="text-sm text-blue-800">
-              Click the link in the email to sign in. If you don't see the
-              email, check your spam folder.
+              Click the link in the email to sign in. If you don't see the email, check your spam folder.
             </p>
           </div>
 
@@ -106,7 +103,7 @@ export default function LoginPage() {
           </button>
         </div>
       </div>
-    );
+    )
   }
 
   return (
@@ -131,7 +128,7 @@ export default function LoginPage() {
             <OAuthButtons
               onSignIn={handleOAuthSignIn}
               disabled={loading}
-              providers={["google", "github"]}
+              providers={['google', 'github']}
             />
 
             <div className="relative">
@@ -151,7 +148,7 @@ export default function LoginPage() {
               <TabsTrigger value="password">Password</TabsTrigger>
               <TabsTrigger value="magic-link">Magic Link</TabsTrigger>
             </TabsList>
-
+            
             <TabsContent value="password" className="mt-6">
               <form onSubmit={handleLogin} className="space-y-6">
                 <div className="space-y-4">
@@ -169,7 +166,7 @@ export default function LoginPage() {
                       className="mt-1"
                     />
                   </div>
-
+                  
                   <div>
                     <div className="flex items-center justify-between">
                       <Label htmlFor="password">Password</Label>
@@ -201,12 +198,12 @@ export default function LoginPage() {
                       Signing in...
                     </>
                   ) : (
-                    "Sign in"
+                    'Sign in'
                   )}
                 </Button>
               </form>
             </TabsContent>
-
+            
             <TabsContent value="magic-link" className="mt-6">
               <form onSubmit={handleMagicLink} className="space-y-6">
                 <div>
@@ -234,7 +231,7 @@ export default function LoginPage() {
                       Sending magic link...
                     </>
                   ) : (
-                    "Send magic link"
+                    'Send magic link'
                   )}
                 </Button>
               </form>
@@ -243,15 +240,12 @@ export default function LoginPage() {
 
           <div className="mt-6 text-center text-sm">
             <span className="text-gray-600">Don't have an account? </span>
-            <Link
-              href="/register"
-              className="font-medium text-primary hover:underline"
-            >
+            <Link href="/register" className="font-medium text-primary hover:underline">
               Sign up
             </Link>
           </div>
         </div>
       </div>
     </div>
-  );
+  )
 }
